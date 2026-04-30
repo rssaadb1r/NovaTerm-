@@ -691,7 +691,12 @@ class MainWindow(QMainWindow):
                 terminal.append_output(f"\r\n[novaterm] connection error: {exc}\r\n")
                 connect_failed = True
             finally:
-                self._set_status_for_content(content, DISCONNECTED)
+                # Preserve the ERROR dot when the connection failed — the
+                # ``finally`` block runs synchronously after ``except`` and
+                # would otherwise paint over the red status before the user
+                # ever sees it.
+                if not connect_failed:
+                    self._set_status_for_content(content, DISCONNECTED)
             if connect_failed and on_failure is not None:
                 on_failure()
 
@@ -852,9 +857,28 @@ class MainWindow(QMainWindow):
 
 
 def terminal_signal_pipe(terminal: TerminalWidget | None, client: AsyncSSHClient) -> None:
-    """Wire ``terminal.text_input`` → ``client.write`` for keystroke forwarding."""
+    """Wire ``terminal.text_input`` → ``client.write`` for keystroke forwarding.
+
+    The previous slot (if any) is disconnected first so that reconnecting a
+    tab via ``Reconnect`` doesn't leave dead closures attached to the same
+    ``text_input`` signal — each closure pins the now-defunct
+    :class:`AsyncSSHClient` it captured, and accumulating them across many
+    reconnects leaks both signal slots and SSH client objects. We stash the
+    most recently installed slot on the terminal widget itself so the next
+    call can disconnect it without having to introspect Qt's connection list.
+    """
     if terminal is None:
         return
+
+    previous = getattr(terminal, "_novaterm_input_slot", None)
+    if previous is not None:
+        try:
+            terminal.text_input.disconnect(previous)
+        except (TypeError, RuntimeError):
+            # Either the slot was never connected on this signal, or the
+            # underlying C++ widget has been torn down; either way there is
+            # nothing more to clean up.
+            pass
 
     def _on_input(text: str) -> None:
         if not client.connected:
@@ -862,3 +886,4 @@ def terminal_signal_pipe(terminal: TerminalWidget | None, client: AsyncSSHClient
         asyncio.ensure_future(client.write(text.encode("utf-8")))
 
     terminal.text_input.connect(_on_input)
+    terminal._novaterm_input_slot = _on_input  # type: ignore[attr-defined]

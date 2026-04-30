@@ -130,7 +130,12 @@ class CredentialVault:
         """
         from sqlalchemy import select as _select
 
-        from .session_store import BastionProfile, MasterAuth, Session as SessionRow
+        from .session_store import (
+            BastionProfile,
+            DefaultSession,
+            MasterAuth,
+            Session as SessionRow,
+        )
 
         self.unlock(old_password)
         old_fernet = self._fernet
@@ -166,6 +171,25 @@ class CredentialVault:
                     decoded.append(
                         (row, "encrypted_credential",
                          old_fernet.decrypt(row.encrypted_credential))
+                    )
+
+            # The Default Session row holds two Fernet ciphertexts that go
+            # through the same vault (see ui/default_session_dialog.py and the
+            # Quick Host Bar in ui/main_window.py). Without re-encrypting them
+            # alongside the per-session and bastion ciphertexts, a master-
+            # password rotation would leave the Default Session unable to
+            # decrypt and silently fall back to ``password = None``.
+            default_row = s.get(DefaultSession, 1)
+            if default_row is not None:
+                if default_row.encrypted_password:
+                    decoded.append(
+                        (default_row, "encrypted_password",
+                         old_fernet.decrypt(default_row.encrypted_password))
+                    )
+                if default_row.encrypted_key_passphrase:
+                    decoded.append(
+                        (default_row, "encrypted_key_passphrase",
+                         old_fernet.decrypt(default_row.encrypted_key_passphrase))
                     )
 
             for row, attr, plaintext in decoded:

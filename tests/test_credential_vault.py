@@ -82,6 +82,15 @@ def test_change_password_preserves_existing_ciphertexts(
         auth_type="password", encrypted_credential=bastion_token,
     )
 
+    # Default Session credentials must also survive a password rotation.
+    default_pw_token = vault.encrypt("default-pw")
+    default_pp_token = vault.encrypt("default-passphrase")
+    store.update_default_session(
+        username="root",
+        encrypted_password=default_pw_token,
+        encrypted_key_passphrase=default_pp_token,
+    )
+
     vault.change_password("old", "new")
 
     refreshed = store.get_session(sid)
@@ -95,10 +104,20 @@ def test_change_password_preserves_existing_ciphertexts(
     assert refreshed_b is not None
     assert vault.decrypt(refreshed_b.encrypted_credential) == "bastion-password"
 
+    refreshed_d = store.get_default_session()
+    assert refreshed_d.encrypted_password is not None
+    assert refreshed_d.encrypted_key_passphrase is not None
+    assert vault.decrypt(refreshed_d.encrypted_password) == "default-pw"
+    assert (
+        vault.decrypt(refreshed_d.encrypted_key_passphrase)
+        == "default-passphrase"
+    )
+
     # And we can still unlock with the new password from a cold start.
     vault.lock()
     vault.unlock("new")
     assert vault.decrypt(refreshed.encrypted_credential) == "session-secret"
+    assert vault.decrypt(refreshed_d.encrypted_password) == "default-pw"
 
 
 def test_export_import_bundle(vault: CredentialVault) -> None:
