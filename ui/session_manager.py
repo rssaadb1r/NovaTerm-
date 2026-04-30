@@ -211,19 +211,9 @@ class SessionManagerPanel(QWidget):
             self._tree.clear()
             query = self._filter.text().strip().lower()
 
-            # Pinned Default Session entry (always at top, ignores filters).
-            default_item = QTreeWidgetItem(["Default Session"])
-            default_item.setData(0, _ROLE, ("default_session", _DEFAULT_SESSION_ID))
-            default_item.setIcon(0, _make_default_icon())
-            default_item.setForeground(0, QBrush(QColor("#1abc9c")))
-            font = default_item.font(0)
-            font.setBold(True)
-            default_item.setFont(0, font)
-            # Don't allow dragging the synthetic entry around.
-            default_item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-            )
-            self._tree.addTopLevelItem(default_item)
+            # Note: the Default Session is intentionally *not* mounted in
+            # the sidebar tree — it has its own toolbar / Options menu
+            # entries and the tree should only show folders + sessions.
 
             folders = {f.id: f for f in self._store.list_folders()}
             folder_items: dict[int | None, QTreeWidgetItem] = {
@@ -284,7 +274,6 @@ class SessionManagerPanel(QWidget):
             # Restore expand/collapse state.
             for fid, folder in folders.items():
                 folder_items[fid].setExpanded(bool(folder.is_expanded))
-            default_item.setExpanded(True)
         finally:
             self._restoring_state = False
 

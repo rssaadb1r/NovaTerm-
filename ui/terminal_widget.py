@@ -32,6 +32,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -169,6 +171,46 @@ class _Match:
     end: int
 
 
+class ConfirmPasteDialog(QDialog):
+    """Modal preview dialog for multi-line right-click pastes.
+
+    The user can edit the staged text before clicking *OK*; *Cancel*
+    aborts and nothing is sent to the remote session.
+    """
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        """Build the dialog seeded with ``text``."""
+        super().__init__(parent)
+        self.setWindowTitle("Confirm Paste")
+        self.setModal(True)
+        self.resize(540, 320)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Review the text before pasting:", self))
+
+        self._editor = QPlainTextEdit(self)
+        self._editor.setPlainText(text)
+        # Monospaced font so columns line up like in the terminal.
+        font = self._editor.font()
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFamily("Monospace")
+        self._editor.setFont(font)
+        layout.addWidget(self._editor, 1)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def text(self) -> str:
+        """Return the (possibly edited) text the user confirmed."""
+        return self._editor.toPlainText()
+
+
 class TerminalWidget(QWidget):
     """Public terminal widget used everywhere else in the app.
 
@@ -296,7 +338,35 @@ class TerminalWidget(QWidget):
     # -- right-click menu -------------------------------------------------
 
     def _show_context_menu(self, point) -> None:
-        """Build and show the in-terminal right-click menu (Feature 4)."""
+        """Right-click handler.
+
+        With a selection active the right-click *pastes* the selected
+        text into the remote session: a single-line selection is sent
+        immediately, a multi-line selection first opens a *Confirm
+        Paste* dialog so the user can review/edit it before sending.
+        With no selection we fall back to the standard Copy / Paste / …
+        menu so those actions are still reachable.
+        """
+        cursor = self._display.textCursor()
+        # ``QPlainTextEdit`` uses U+2028 as the line separator inside a
+        # selection; normalise that to ``\n`` so callers don't have to.
+        selected = (
+            cursor.selectedText().replace("\u2028", "\n")
+            if cursor.hasSelection()
+            else ""
+        )
+
+        if selected:
+            if "\n" in selected:
+                dlg = ConfirmPasteDialog(selected, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    final = dlg.text()
+                    if final:
+                        self.text_input.emit(final)
+            else:
+                self.text_input.emit(selected)
+            return
+
         menu = QMenu(self)
         menu.addAction(self._make_action("Copy", self._display.copy))
         menu.addAction(self._make_action("Paste", self._display.paste))

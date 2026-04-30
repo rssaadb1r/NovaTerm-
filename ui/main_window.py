@@ -9,6 +9,7 @@ from typing import Any
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDockWidget,
     QFileDialog,
     QInputDialog,
@@ -28,6 +29,7 @@ from core.session_store import SessionStore
 from core.ssh_client import AsyncSSHClient, HopConfig, SSHConnectConfig
 
 from .button_bar import ButtonBar
+from .host_input import HostInputLineEdit
 from .cluster_bar import ClusterInputBar, ClusterSelectDialog
 from .command_manager import CommandFuzzyPopup
 from .command_manager_editor import CommandManagerEditor
@@ -226,15 +228,18 @@ class MainWindow(QMainWindow):
             self._make_action("Default Session…", self._on_edit_default_session)
         )
 
-        # SecureCRT-style Quick Host Bar: type a hostname, click Connect,
-        # the Default Session credentials are used automatically.
+        # SecureCRT-style Quick Host Bar. The user types a hostname, picks
+        # a protocol, and presses Enter — we connect using the Default
+        # Session credentials. There is *no* Connect button: Enter is the
+        # only commit gesture (per the UX spec).
         bar.addSeparator()
-        self._host_bar = QLineEdit(self)
-        self._host_bar.setPlaceholderText("hostname…")
-        self._host_bar.setMinimumWidth(220)
+        self._host_bar = HostInputLineEdit(self._store, self)
+        self._host_bar.setMaximumWidth(200)
         self._host_bar.returnPressed.connect(self._on_host_bar_connect)
         bar.addWidget(self._host_bar)
-        bar.addAction(self._make_action("Connect", self._on_host_bar_connect))
+        self._host_protocol = QComboBox(self)
+        self._host_protocol.addItems(["ssh", "telnet"])
+        bar.addWidget(self._host_protocol)
 
     def _install_shortcuts(self) -> None:
         """Install global QShortcut bindings (see CLAUDE.md §9)."""
@@ -491,8 +496,11 @@ class MainWindow(QMainWindow):
                 password = None
 
         username = defaults.username or None
-        port = defaults.port or 22
-        protocol = defaults.protocol or "ssh"
+        # Toolbar protocol picker overrides the Default Session value;
+        # the Quick Host Bar's whole point is to switch protocol per
+        # connection without opening a dialog.
+        protocol = self._host_protocol.currentText() or defaults.protocol or "ssh"
+        port = defaults.port or (23 if protocol == "telnet" else 22)
         label = f"{username}@{host}" if username else host
         content = self._new_terminal_tab(
             session_id=None, name=label, color_tag=None
