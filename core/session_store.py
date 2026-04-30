@@ -281,7 +281,33 @@ class SessionStore:
         )
         self._engine = create_engine(url, future=True)
         Base.metadata.create_all(self._engine)
+        self._apply_lazy_migrations()
         self._Session = sessionmaker(bind=self._engine, expire_on_commit=False, future=True)
+
+    def _apply_lazy_migrations(self) -> None:
+        """Tiny idempotent migrations for databases created by older builds.
+
+        SQLAlchemy's ``create_all`` only creates *missing* tables, never
+        adds columns to existing tables. We therefore patch in any columns
+        we have introduced after first ship so that users with an existing
+        ``novaterm.sqlite3`` don't have to delete it. Each ``ALTER TABLE`` is
+        guarded by a ``PRAGMA table_info`` check so the migration is safe to
+        run on every startup.
+        """
+        with self._engine.begin() as conn:
+            cols = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(folders)"
+                ).fetchall()
+            }
+            if "is_expanded" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE folders ADD COLUMN is_expanded BOOLEAN "
+                    "NOT NULL DEFAULT 1"
+                )
+            # ``default_session`` ships as a brand-new table, so
+            # ``create_all`` already handled it; nothing else to migrate yet.
 
     # -- session lifecycle -------------------------------------------------
 
