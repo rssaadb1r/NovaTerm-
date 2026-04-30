@@ -276,6 +276,33 @@ class SessionManagerPanel(QWidget):
                 folder_items[fid].setExpanded(bool(folder.is_expanded))
         finally:
             self._restoring_state = False
+        # Force the viewport to repaint immediately so the user sees
+        # newly-created / renamed / deleted rows without having to nudge
+        # the window (some Wayland compositors otherwise ship a stale
+        # frame until the next focus / resize).
+        self._tree.viewport().update()
+
+    def select_session(self, session_id: int) -> None:
+        """Select (and scroll to) the tree row for ``session_id`` if present."""
+        def walk(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                data = ch.data(0, _ROLE)
+                if (
+                    isinstance(data, tuple)
+                    and data[0] == "session"
+                    and int(data[1]) == int(session_id)
+                ):
+                    return ch
+                hit = walk(ch)
+                if hit is not None:
+                    return hit
+            return None
+
+        target = walk(self._tree.invisibleRootItem())
+        if target is not None:
+            self._tree.setCurrentItem(target)
+            self._tree.scrollToItem(target)
 
     # -- selection helpers ------------------------------------------------
 

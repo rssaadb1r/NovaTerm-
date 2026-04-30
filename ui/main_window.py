@@ -449,18 +449,32 @@ class MainWindow(QMainWindow):
 
         :param folder_id: Optional folder id passed from the sidebar context
             menu so the new session pre-targets the folder the user clicked.
+            QActions emit ``triggered(checked: bool)`` — we ignore that
+            payload because :class:`bool` is an :class:`int` subclass and
+            we don't want ``True`` to be misread as folder id 1.
         """
-        target_folder = (
-            int(folder_id) if isinstance(folder_id, int) and folder_id > 0 else None
-        )
+        target_folder: int | None = None
+        if (
+            isinstance(folder_id, int)
+            and not isinstance(folder_id, bool)
+            and folder_id > 0
+        ):
+            target_folder = int(folder_id)
         dlg = SessionDialog(
             self._store, parent=self, default_folder_id=target_folder
         )
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
         fields = dlg.fields()
-        self._store.create_session(**fields)
+        new_id = self._store.create_session(**fields)
+        # Expand the destination folder so the freshly-created session is
+        # immediately visible (otherwise it lands inside a collapsed
+        # folder and the user reasonably believes the create failed).
+        chosen_folder = fields.get("folder_id")
+        if isinstance(chosen_folder, int) and chosen_folder > 0:
+            self._store.set_folder_expanded(chosen_folder, True)
         self._sidebar.refresh()
+        self._sidebar.select_session(new_id)
 
     def _on_edit_default_session(self) -> None:
         """Open the Default Session editor."""
@@ -547,9 +561,12 @@ class MainWindow(QMainWindow):
                 jumps=[],
             )
 
-    def _on_edit_session(self, sid: int) -> None:
+    def _on_edit_session(self, sid: int | bool) -> None:
         """Edit an existing session row."""
-        sess = self._store.get_session(sid)
+        if isinstance(sid, bool):
+            return
+        sess = self._store.get_session(int(sid))
+        sid = int(sid)
         if sess is None:
             return
         dlg = SessionDialog(self._store, existing=sess, parent=self)
