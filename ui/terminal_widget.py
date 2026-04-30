@@ -387,7 +387,15 @@ class TerminalWidget(QWidget):
     # -- key forwarding ----------------------------------------------------
 
     def eventFilter(self, obj, event):  # noqa: N802 — Qt API
-        """Forward typing on the QPlainTextEdit upstream as ``text_input``."""
+        """Forward typing on the QPlainTextEdit upstream as ``text_input``.
+
+        We *consume* any printable key event after emitting ``text_input`` so
+        the underlying ``QPlainTextEdit`` does not also insert the character
+        locally — otherwise every keystroke would appear twice once the
+        remote echo arrives via :meth:`append_output`. Non-printable keys
+        (arrow keys, modifiers, etc.) fall through to default handling so
+        the user can still navigate the scrollback with the keyboard.
+        """
         if obj is self._display and event.type() == event.Type.KeyPress:
             assert isinstance(event, QKeyEvent)
             if event.key() == Qt.Key.Key_F and (
@@ -398,4 +406,5 @@ class TerminalWidget(QWidget):
             text = event.text()
             if text:
                 self.text_input.emit(text)
+                return True
         return super().eventFilter(obj, event)

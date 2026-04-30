@@ -68,6 +68,10 @@ class MainWindow(QMainWindow):
         # detached, or reordered, but the widget object is stable.
         self._cluster_targets: set[TabContent] = set()
         self._ssh_clients: dict[TabContent, AsyncSSHClient] = {}
+        # Detached floating windows must outlive the method that creates
+        # them — PyQt6 destroys parentless QWidgets the moment their Python
+        # wrapper goes out of scope. We keep strong references here.
+        self._floating_windows: list[QMainWindow] = []
 
         # -- central layout ------------------------------------------------
         central = QWidget(self)
@@ -260,11 +264,13 @@ class MainWindow(QMainWindow):
     def _detach_tab(self, index: int) -> None:
         """Move the tab into a free-floating window.
 
-        The :class:`TabContent` widget retains its identity as it moves out of
-        the tab bar, so its entry in ``_ssh_clients`` and ``_cluster_targets``
-        remains valid — but it can no longer be addressed via the cluster
-        bar / right-click menu, so we drop it from those collections to
-        avoid 'phantom' broadcasts.
+        The :class:`TabContent` widget keeps its identity when it leaves
+        the tab bar. Its entry in ``_ssh_clients`` / ``_cluster_targets``
+        is still valid, but it can no longer be addressed via the cluster
+        bar or right-click menu — so we drop it from those collections to
+        avoid 'phantom' broadcasts. The new :class:`QMainWindow` is also
+        retained on ``self._floating_windows`` so PyQt6 doesn't garbage-
+        collect it the moment this method returns.
         """
         content = self._content_at(index)
         if content is None:
@@ -276,6 +282,12 @@ class MainWindow(QMainWindow):
         floating.setWindowTitle(content.session_name)
         floating.setCentralWidget(content)
         floating.resize(900, 600)
+        floating.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        floating.destroyed.connect(
+            lambda _obj=None, w=floating: self._floating_windows.remove(w)
+            if w in self._floating_windows else None
+        )
+        self._floating_windows.append(floating)
         floating.show()
         # Keep the SSH session alive in the floating window: pin the client
         # on the widget itself so it isn't garbage-collected.
@@ -346,6 +358,7 @@ class MainWindow(QMainWindow):
                 port=data.port,
                 username=data.username,
                 password=None,
+                jumps=[],
             )
 
     def _on_new_session(self) -> None:
@@ -398,7 +411,9 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Import sessions", "", "JSON (*.json)")
         if not path:
             return
-        added = self._store.import_sessions_json(open(path).read())
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = fh.read()
+        added = self._store.import_sessions_json(payload)
         QMessageBox.information(self, "Import", f"Imported {added} session(s)")
         self._sidebar.refresh()
 
@@ -426,14 +441,49 @@ class MainWindow(QMainWindow):
                     password = self._vault.decrypt(sess.encrypted_credential)
                 except VaultAuthError:
                     password = None
+            jumps = self._resolve_jump_chain(sess.jump_host_chain or [])
             self._connect_ssh(
                 content,
                 hostname=sess.hostname,
                 port=sess.port,
                 username=sess.username or "",
                 password=password,
+                jumps=jumps,
             )
         self._store.touch_last_connected(sid)
+
+    def _resolve_jump_chain(self, bastion_ids: list[int]) -> list[HopConfig]:
+        """Turn a list of :class:`BastionProfile` ids into ``HopConfig`` hops.
+
+        Decrypts each bastion's stored credential through the vault when the
+        vault is unlocked. Bastions whose IDs no longer exist are skipped.
+        """
+        hops: list[HopConfig] = []
+        for bid in bastion_ids:
+            bastion = self._store.get_bastion(int(bid))
+            if bastion is None:
+                logger.warning("jump-host id %s missing, skipping", bid)
+                continue
+            password: str | None = None
+            if (
+                bastion.auth_type == "password"
+                and bastion.encrypted_credential
+                and self._vault.is_unlocked()
+            ):
+                try:
+                    password = self._vault.decrypt(bastion.encrypted_credential)
+                except VaultAuthError:
+                    password = None
+            hops.append(
+                HopConfig(
+                    hostname=bastion.hostname,
+                    port=bastion.port,
+                    username=bastion.username or "",
+                    password=password,
+                    key_path=bastion.key_path,
+                )
+            )
+        return hops
 
     def _connect_ssh(
         self,
@@ -443,8 +493,13 @@ class MainWindow(QMainWindow):
         port: int,
         username: str | None,
         password: str | None,
+        jumps: list[HopConfig] | None = None,
     ) -> None:
-        """Spawn the asyncio task that brings up the SSH connection."""
+        """Spawn the asyncio task that brings up the SSH connection.
+
+        ``jumps`` is an ordered list of :class:`HopConfig` describing the
+        ProxyJump chain (resolved from the session's ``jump_host_chain``).
+        """
         config = SSHConnectConfig(
             target=HopConfig(
                 hostname=hostname,
@@ -452,7 +507,7 @@ class MainWindow(QMainWindow):
                 username=username or "",
                 password=password,
             ),
-            jumps=[],
+            jumps=list(jumps or []),
             keepalive_interval=int(self._settings["advanced"]["ssh_keepalive_seconds"]),
             connect_timeout=int(self._settings["advanced"]["connect_timeout_seconds"]),
             auto_reconnect_retries=int(self._settings["advanced"]["auto_reconnect_retries"]),
