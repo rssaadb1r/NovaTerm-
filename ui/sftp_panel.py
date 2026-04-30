@@ -118,7 +118,14 @@ class _RemotePane(QWidget):
         """Navigate one directory up."""
         if self._cwd in {".", "/"}:
             return
-        self._cwd = "/".join(self._cwd.rstrip("/").split("/")[:-1]) or "/"
+        # If the current path is a single relative component (e.g. ``documents``
+        # reached from the initial ``"."`` listing), splitting gives ``[""]``
+        # and we'd jump to the filesystem root. Fall back to ``"."`` so we
+        # land back in the SFTP session's starting directory.
+        if self._cwd.startswith("/"):
+            self._cwd = "/".join(self._cwd.rstrip("/").split("/")[:-1]) or "/"
+        else:
+            self._cwd = "/".join(self._cwd.rstrip("/").split("/")[:-1]) or "."
         self.refresh()
 
     def _navigate(self) -> None:

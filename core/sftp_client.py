@@ -78,14 +78,32 @@ class SFTPClient:
         self._sftp: paramiko.SFTPClient | None = None
 
     def _get(self) -> paramiko.SFTPClient:
-        """Lazily open / reopen the SFTP subsystem."""
+        """Lazily open / reopen the SFTP subsystem (single shared channel).
+
+        This channel is used by the synchronous read/metadata operations
+        below (``listdir``, ``mkdir``, ``remove``, …). The transfer queue
+        instead opens a *fresh* per-thread channel via
+        :meth:`open_channel` because :class:`paramiko.SFTPClient` is not
+        thread-safe.
+        """
         if self._sftp is None:
-            transport = self._ssh.get_transport()
-            if transport is None:
-                raise RuntimeError("SSH transport not available")
-            self._sftp = paramiko.SFTPClient.from_transport(transport)
-            assert self._sftp is not None
+            self._sftp = self.open_channel()
         return self._sftp
+
+    def open_channel(self) -> paramiko.SFTPClient:
+        """Return a brand-new :class:`paramiko.SFTPClient` over this transport.
+
+        Each call opens a separate SFTP channel. Callers performing work
+        from worker threads must use this method (and close the result
+        themselves) rather than sharing the cached channel.
+        """
+        transport = self._ssh.get_transport()
+        if transport is None:
+            raise RuntimeError("SSH transport not available")
+        client = paramiko.SFTPClient.from_transport(transport)
+        if client is None:  # pragma: no cover — paramiko returns None only on closed transport
+            raise RuntimeError("Failed to open SFTP channel")
+        return client
 
     def reconnect_if_needed(self) -> None:
         """Drop and reopen the SFTP channel if the server has hung up."""
@@ -180,9 +198,12 @@ class SFTPTransferQueue:
         self._jobs[tid] = progress
 
         def _run() -> int:
+            # Each worker opens its own paramiko.SFTPClient channel.
+            # paramiko.SFTPClient is not thread-safe (it multiplexes
+            # request IDs over a single channel), so concurrent put/get
+            # calls would interleave protocol frames and corrupt state.
+            sftp = self._sftp.open_channel()
             try:
-                sftp = self._sftp._get()  # noqa: SLF001 — internal helper
-
                 def cb(transferred: int, _total: int) -> None:
                     progress.transferred = transferred
 
@@ -192,6 +213,10 @@ class SFTPTransferQueue:
                 progress.error = str(exc)
                 logger.exception("Upload failed")
             finally:
+                try:
+                    sftp.close()
+                except Exception:  # pragma: no cover
+                    pass
                 progress.finished = True
             return tid
 
@@ -216,8 +241,9 @@ class SFTPTransferQueue:
         self._jobs[tid] = progress
 
         def _run() -> int:
+            # Per-thread SFTP channel — see ``upload`` for rationale.
+            sftp = self._sftp.open_channel()
             try:
-                sftp = self._sftp._get()  # noqa: SLF001
                 local.parent.mkdir(parents=True, exist_ok=True)
 
                 def cb(transferred: int, _total: int) -> None:
@@ -229,6 +255,10 @@ class SFTPTransferQueue:
                 progress.error = str(exc)
                 logger.exception("Download failed")
             finally:
+                try:
+                    sftp.close()
+                except Exception:  # pragma: no cover
+                    pass
                 progress.finished = True
             return tid
 

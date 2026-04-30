@@ -256,10 +256,16 @@ class MainWindow(QMainWindow):
         self._tabs.set_tab_status(index, DISCONNECTED)
 
     def _reconnect_tab(self, index: int) -> None:
-        """Reconnect the tab using the saved session id, if any."""
+        """Reconnect the tab using the saved session id, if any.
+
+        Reuses the existing :class:`TabContent` (and its terminal widget)
+        rather than creating a duplicate tab — this keeps the user’s
+        scrollback in the same place and avoids ending up with one
+        DISCONNECTED orphan tab next to the freshly-connected one.
+        """
         widget = self._tabs.widget(index)
         if isinstance(widget, TabContent) and widget.session_id is not None:
-            self._open_saved_session(widget.session_id)
+            self._open_saved_session(widget.session_id, into=widget)
 
     def _detach_tab(self, index: int) -> None:
         """Move the tab into a free-floating window.
@@ -426,14 +432,36 @@ class MainWindow(QMainWindow):
             fh.write(self._store.export_sessions_json())
         QMessageBox.information(self, "Export", f"Saved to {path}")
 
-    def _open_saved_session(self, sid: int) -> None:
-        """Activate a saved session (opens a tab + connects)."""
+    def _open_saved_session(
+        self, sid: int, *, into: TabContent | None = None
+    ) -> None:
+        """Activate a saved session.
+
+        :param sid:  Session id to open.
+        :param into: Optional existing :class:`TabContent` to reuse instead
+            of opening a fresh tab — used by the *Reconnect* action so the
+            user sees the reconnection happen in the same tab.
+        """
         sess = self._store.get_session(sid)
         if sess is None:
             return
-        content = self._new_terminal_tab(
-            session_id=sess.id, name=sess.name, color_tag=sess.color_tag
-        )
+        if into is not None:
+            content = into
+            # Drop any stale SSH client / cluster membership tied to the
+            # previous incarnation of this tab so we start clean.
+            old_client = self._ssh_clients.pop(content, None)
+            if old_client is not None:
+                asyncio.ensure_future(old_client.disconnect())
+            content.session_id = sess.id
+            content.session_name = sess.name
+            content.color_tag = sess.color_tag
+            idx = self._tabs.indexOf(content)
+            if idx >= 0:
+                self._tabs.setTabText(idx, sess.name)
+        else:
+            content = self._new_terminal_tab(
+                session_id=sess.id, name=sess.name, color_tag=sess.color_tag
+            )
         if sess.protocol == "ssh":
             password: str | None = None
             if sess.auth_type == "password" and sess.encrypted_credential and self._vault.is_unlocked():

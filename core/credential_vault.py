@@ -121,15 +121,66 @@ class CredentialVault:
     def change_password(self, old_password: str, new_password: str) -> None:
         """Re-key the vault with a new master password.
 
-        Note: existing ciphertexts in the database remain valid only if the
-        caller re-encrypts them with the new key. Callers are responsible for
-        walking and re-encrypting all secrets after this returns.
+        This atomically re-encrypts every Fernet ciphertext currently stored
+        in the database (per-session credentials, SSH key passphrases, and
+        bastion-profile credentials) with the freshly-derived key, then
+        swaps in the new master-auth row. If any decrypt fails (e.g. a
+        corrupted token) the in-memory key is left untouched and the
+        database is not modified, so the caller can retry safely.
         """
+        from sqlalchemy import select as _select
+
+        from .session_store import BastionProfile, MasterAuth, Session as SessionRow
+
         self.unlock(old_password)
+        old_fernet = self._fernet
+        assert old_fernet is not None  # unlock() set it
+
         salt = os.urandom(SALT_BYTES)
-        bcrypt_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt())
-        self._store.set_master_auth(bcrypt_hash=bcrypt_hash, kdf_salt=salt)
-        self._fernet = Fernet(_derive_key(new_password, salt))
+        new_fernet = Fernet(_derive_key(new_password, salt))
+
+        # Re-encrypt every Fernet ciphertext and rotate the master-auth row
+        # inside a single transaction so a crash mid-way leaves the DB
+        # consistent (rollback restores the old hash + ciphertexts together
+        # with the rows we touched).
+        with self._store.session() as s:
+            sessions = list(s.scalars(_select(SessionRow)))
+            bastions = list(s.scalars(_select(BastionProfile)))
+
+            # Decrypt everything *first* so a failure surfaces before any
+            # writes; SQLAlchemy will roll back the open transaction.
+            decoded: list[tuple[object, str, bytes]] = []
+            for row in sessions:
+                if row.encrypted_credential:
+                    decoded.append(
+                        (row, "encrypted_credential",
+                         old_fernet.decrypt(row.encrypted_credential))
+                    )
+                if row.encrypted_key_passphrase:
+                    decoded.append(
+                        (row, "encrypted_key_passphrase",
+                         old_fernet.decrypt(row.encrypted_key_passphrase))
+                    )
+            for row in bastions:
+                if row.encrypted_credential:
+                    decoded.append(
+                        (row, "encrypted_credential",
+                         old_fernet.decrypt(row.encrypted_credential))
+                    )
+
+            for row, attr, plaintext in decoded:
+                setattr(row, attr, new_fernet.encrypt(plaintext))
+
+            existing = s.scalars(_select(MasterAuth).limit(1)).first()
+            if existing is not None:
+                s.delete(existing)
+                s.flush()
+            bcrypt_hash = bcrypt.hashpw(
+                new_password.encode("utf-8"), bcrypt.gensalt()
+            )
+            s.add(MasterAuth(bcrypt_hash=bcrypt_hash, kdf_salt=salt))
+
+        self._fernet = new_fernet
 
     # -- crypto --------------------------------------------------------------
 
