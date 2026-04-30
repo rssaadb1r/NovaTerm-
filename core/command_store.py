@@ -18,8 +18,15 @@ _VAR_RE = re.compile(r"%(HOST|USER|SESSION|DATE|TIME)%")
 
 
 def _safe_filename(text: str) -> str:
-    """Sanitise text for safe inclusion in a filename."""
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text or "session")
+    """Sanitise text for safe inclusion in a filename.
+
+    Drops every character that is not an ASCII letter, digit, ``_`` or
+    ``-``. In particular ``.`` is *not* preserved — leaving it in would
+    let a session named ``..`` collapse to ``..`` and walk out of the
+    intended log directory when ``%SESSION%`` is substituted into a
+    path template (path-traversal via the variable substitution layer).
+    """
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", text or "session")
 
 
 def substitute_variables(

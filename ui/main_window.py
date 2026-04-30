@@ -315,10 +315,17 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentIndex((self._tabs.currentIndex() + delta) % n)
 
     def _disconnect_tab(self, index: int) -> None:
-        """Disconnect the SSH backend for tab ``index`` (keeps the tab open)."""
+        """Disconnect the SSH backend for tab ``index`` (keeps the tab open).
+
+        The client is *removed* from ``_ssh_clients`` rather than merely
+        looked up; otherwise the dict accumulates stale entries that the
+        cluster broadcaster and *Send to All* helpers would still iterate
+        over (only their ``client.connected`` guards stop them from
+        emitting bytes to a closed channel).
+        """
         content = self._content_at(index)
         if content is not None:
-            client = self._ssh_clients.get(content)
+            client = self._ssh_clients.pop(content, None)
             if client is not None:
                 asyncio.ensure_future(client.disconnect())
         self._tabs.set_tab_status(index, DISCONNECTED)
@@ -761,7 +768,13 @@ class MainWindow(QMainWindow):
                     f"\r\n[novaterm] session ended: {exc}\r\n"
                 )
             finally:
-                self._set_status_for_content(content, DISCONNECTED)
+                # If a *new* connection has already replaced this client
+                # in ``_ssh_clients`` (e.g. the user clicked Reconnect),
+                # do not paint DISCONNECTED — that would race against the
+                # new runner's CONNECTED status update and leave the tab
+                # showing a grey dot even though SSH is alive.
+                if self._ssh_clients.get(content) is client:
+                    self._set_status_for_content(content, DISCONNECTED)
 
         asyncio.ensure_future(_runner())
 

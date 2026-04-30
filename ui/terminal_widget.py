@@ -1,12 +1,18 @@
 """Terminal display widget + inline find/highlight bar (Feature 9).
 
-NovaTerm's terminal display is a pyte-based emulator embedded in a
-``QPlainTextEdit``. The original spec called for the C++ ``QTermWidget``,
-but no usable PyQt6 binding for that library is available on PyPI for
-Linux Fedora 44 (see CLAUDE.md sections 1 and 10 for the design note).
-The pyte fallback is therefore the only backend; the public API exposed
-by :class:`TerminalWidget` is unchanged from the spec so a future native
-backend can be slotted in without touching callers.
+NovaTerm's terminal display is a ``QPlainTextEdit`` with an inline
+ANSI-stripping layer applied to remote output. The original spec called
+for the C++ ``QTermWidget``, but no usable PyQt6 binding for that
+library is available on PyPI for Linux Fedora 44 (see CLAUDE.md
+sections 1 and 10 for the design note). Until a native backend can be
+slotted in we strip CSI / OSC / single-character escape sequences from
+the byte stream so raw SSH output renders as readable text instead of
+garbled escape codes; full ANSI emulation (colour, cursor positioning,
+etc.) is a known follow-up.
+
+The public API exposed by :class:`TerminalWidget` is unchanged from the
+spec so a future native backend can be slotted in without touching
+callers.
 """
 from __future__ import annotations
 
@@ -37,6 +43,24 @@ from PyQt6.QtWidgets import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Match any ANSI escape sequence we know how to throw away:
+#   * CSI sequences:   ESC [ <params> <final-byte 0x40-0x7E>
+#   * OSC sequences:   ESC ]  ... BEL  or  ESC ] ... ESC \
+#   * Single-char esc: ESC <char in 0x40..0x5F>
+# Plus the DEL byte (0x7F) and the bare BEL (0x07) which some shells
+# emit on tab-completion failures.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC
+    r"|\x1b[@-_]"  # 2-byte ESC + final
+    r"|[\x07\x7f]"
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Return ``text`` with ANSI escape sequences removed."""
+    return _ANSI_RE.sub("", text)
 
 # ---------------------------------------------------------------------------
 # Find bar
@@ -198,10 +222,20 @@ class TerminalWidget(QWidget):
     # -- public API --------------------------------------------------------
 
     def append_output(self, text: str) -> None:
-        """Append output received from the remote side."""
+        """Append output received from the remote side.
+
+        Raw SSH output frequently contains ANSI escape sequences (e.g.
+        ``\x1b[31m`` colour codes, ``\x1b]0;title\x07`` OSC titles,
+        cursor moves, etc.). The current backend has no terminal
+        emulator wired up, so we strip those sequences here — otherwise
+        they show up as visible gibberish in the QPlainTextEdit.
+        """
+        clean = _strip_ansi(text)
+        if not clean:
+            return
         cursor = self._display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text)
+        cursor.insertText(clean)
         self._display.setTextCursor(cursor)
         self._display.ensureCursorVisible()
         if self._matches:
