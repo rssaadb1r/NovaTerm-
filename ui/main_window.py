@@ -541,7 +541,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export sessions", "", "JSON (*.json)")
         if not path:
             return
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(self._store.export_sessions_json())
         QMessageBox.information(self, "Export", f"Saved to {path}")
 
@@ -675,30 +675,47 @@ class MainWindow(QMainWindow):
         async def _runner() -> None:
             terminal = content.terminal()
             connect_failed = False
+            # Phase 1 — initial handshake. Only failures here should fire
+            # ``on_failure`` (and paint the ERROR dot); a later read-loop
+            # exception means we *had* a working session that subsequently
+            # dropped, which is normal disconnect territory.
             try:
                 # ``progress`` is invoked on the main loop (see ssh_client.py).
-                await client.connect(progress=lambda m: self.statusBar().showMessage(m))
-                self._set_status_for_content(content, CONNECTED)
-                terminal_signal_pipe(terminal, client)
+                await client.connect(
+                    progress=lambda m: self.statusBar().showMessage(m)
+                )
+            except Exception as exc:
+                logger.exception("SSH connect failed")
+                self._set_status_for_content(content, ERROR)
+                terminal.append_output(
+                    f"\r\n[novaterm] connection error: {exc}\r\n"
+                )
+                connect_failed = True
+                if on_failure is not None:
+                    on_failure()
+                return
+
+            # Phase 2 — connected; pump bytes until the remote side closes
+            # or the user disconnects. A drop here just means "session
+            # ended", so we paint DISCONNECTED, never re-trigger the
+            # Quick-Connect fallback dialog.
+            self._set_status_for_content(content, CONNECTED)
+            terminal_signal_pipe(terminal, client)
+            try:
                 while client.connected:
                     chunk = await client.read(4096)
                     if not chunk:
                         break
-                    terminal.append_output(chunk.decode("utf-8", errors="replace"))
+                    terminal.append_output(
+                        chunk.decode("utf-8", errors="replace")
+                    )
             except Exception as exc:
-                logger.exception("SSH session failed")
-                self._set_status_for_content(content, ERROR)
-                terminal.append_output(f"\r\n[novaterm] connection error: {exc}\r\n")
-                connect_failed = True
+                logger.exception("SSH read loop ended with error")
+                terminal.append_output(
+                    f"\r\n[novaterm] session ended: {exc}\r\n"
+                )
             finally:
-                # Preserve the ERROR dot when the connection failed — the
-                # ``finally`` block runs synchronously after ``except`` and
-                # would otherwise paint over the red status before the user
-                # ever sees it.
-                if not connect_failed:
-                    self._set_status_for_content(content, DISCONNECTED)
-            if connect_failed and on_failure is not None:
-                on_failure()
+                self._set_status_for_content(content, DISCONNECTED)
 
         asyncio.ensure_future(_runner())
 

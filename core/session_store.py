@@ -453,7 +453,9 @@ class SessionStore:
         with self.session() as s:
             row = s.get(Session, session_id)
             if row is not None:
-                row.last_connected_at = datetime.utcnow()
+                row.last_connected_at = datetime.now(timezone.utc).replace(
+                    tzinfo=None
+                )
 
     # -- bastion profiles --------------------------------------------------
 

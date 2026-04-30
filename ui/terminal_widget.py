@@ -1,9 +1,12 @@
 """Terminal display widget + inline find/highlight bar (Feature 9).
 
-We try to import the C++ ``qtermwidget`` binding first; if unavailable we
-fall back to a self-contained pyte-based emulator embedded in a
-``QPlainTextEdit``. The public API exposed to the rest of the app
-(:class:`TerminalWidget`) is the same in either case.
+NovaTerm's terminal display is a pyte-based emulator embedded in a
+``QPlainTextEdit``. The original spec called for the C++ ``QTermWidget``,
+but no usable PyQt6 binding for that library is available on PyPI for
+Linux Fedora 44 (see CLAUDE.md sections 1 and 10 for the design note).
+The pyte fallback is therefore the only backend; the public API exposed
+by :class:`TerminalWidget` is unchanged from the spec so a future native
+backend can be slotted in without touching callers.
 """
 from __future__ import annotations
 
@@ -34,13 +37,6 @@ from PyQt6.QtWidgets import (
 )
 
 logger = logging.getLogger(__name__)
-
-try:  # pragma: no cover — system-dependent.
-    import qtermwidget  # type: ignore
-    _HAVE_QTERMWIDGET = True
-except Exception:
-    _HAVE_QTERMWIDGET = False
-
 
 # ---------------------------------------------------------------------------
 # Find bar
