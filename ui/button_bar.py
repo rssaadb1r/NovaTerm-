@@ -202,15 +202,18 @@ class ButtonBar(QFrame):
         """
         host = self._button_host
         available = host.width()
+        host_height = host.height() or (MAX_HEIGHT - 4)
+        button_height = max(20, min(MAX_HEIGHT - 8, host_height - 2))
         if available <= 0:
             return
 
         # Empty state — nothing to lay out, just show the placeholder.
         if not self._buttons:
+            label_h = self._empty_label.sizeHint().height()
             self._empty_label.setGeometry(
-                4, (MAX_HEIGHT - self._empty_label.sizeHint().height()) // 2,
+                4, max(0, (host_height - label_h) // 2),
                 max(0, available - 8),
-                self._empty_label.sizeHint().height(),
+                label_h,
             )
             self._empty_label.show()
             self._overflow_button.hide()
@@ -219,7 +222,10 @@ class ButtonBar(QFrame):
         self._empty_label.hide()
 
         x = 0
-        y = (MAX_HEIGHT - 8 - 4) // 2  # vertically centre within host
+        # Vertically centre buttons inside the host's *actual* height —
+        # using a constant offset based on MAX_HEIGHT pushed buttons
+        # below the visible area when host_height < MAX_HEIGHT.
+        y = max(0, (host_height - button_height) // 2)
         # Reserve room for the overflow button + spacing whenever any
         # command would otherwise overflow.
         overflow_reserve = (
@@ -253,7 +259,7 @@ class ButtonBar(QFrame):
                 cursor,
                 y,
                 btn.sizeHint().width(),
-                MAX_HEIGHT - 8,
+                button_height,
             )
             btn.show()
             cursor += btn.sizeHint().width() + _BUTTON_SPACING

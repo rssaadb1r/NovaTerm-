@@ -415,9 +415,10 @@ class MainWindow(QMainWindow):
         data = dlg.result_data()
         if not data.hostname:
             return
+        # Tab label is the hostname only — no user / port / protocol.
         content = self._new_terminal_tab(
             session_id=None,
-            name=f"{data.username}@{data.hostname}" if data.username else data.hostname,
+            name=data.hostname,
             color_tag=None,
         )
         if data.save_as_session:
@@ -496,9 +497,9 @@ class MainWindow(QMainWindow):
         # has no protocol picker (per the UX spec).
         protocol = defaults.protocol or "ssh"
         port = defaults.port or (23 if protocol == "telnet" else 22)
-        label = f"{username}@{host}" if username else host
+        # Tab label is the hostname only — no user / port / protocol.
         content = self._new_terminal_tab(
-            session_id=None, name=label, color_tag=None
+            session_id=None, name=host, color_tag=None
         )
         self._store.add_recent_connection(host, port, protocol, username)
         if protocol == "ssh":
@@ -527,9 +528,10 @@ class MainWindow(QMainWindow):
         data = dlg.result_data()
         if not data.hostname:
             return
+        # Tab label is the hostname only — no user / port / protocol.
         content = self._new_terminal_tab(
             session_id=None,
-            name=f"{data.username}@{data.hostname}" if data.username else data.hostname,
+            name=data.hostname,
             color_tag=None,
         )
         self._store.add_recent_connection(
@@ -626,10 +628,13 @@ class MainWindow(QMainWindow):
             content.color_tag = sess.color_tag
             idx = self._tabs.indexOf(content)
             if idx >= 0:
-                self._tabs.setTabText(idx, sess.name)
+                # Tab label is the hostname only — not the session name.
+                self._tabs.setTabText(idx, sess.hostname or sess.name)
         else:
             content = self._new_terminal_tab(
-                session_id=sess.id, name=sess.name, color_tag=sess.color_tag
+                session_id=sess.id,
+                name=sess.hostname or sess.name,
+                color_tag=sess.color_tag,
             )
         if sess.protocol == "ssh":
             password: str | None = None
