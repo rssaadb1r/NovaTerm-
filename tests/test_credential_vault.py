@@ -120,6 +120,71 @@ def test_change_password_preserves_existing_ciphertexts(
     assert vault.decrypt(refreshed_d.encrypted_password) == "default-pw"
 
 
+def test_master_password_full_lifecycle(
+    vault: CredentialVault, store: SessionStore
+) -> None:
+    """Cover the full master-password contract in one place:
+
+    1. Wrong password is rejected.
+    2. Correct password unlocks the vault.
+    3. After rotation the *old* password no longer works.
+    4. After rotation the *new* password unlocks the vault and stored
+       credentials still decrypt cleanly.
+    """
+    vault.initialize("first")
+    cred_token = vault.encrypt("payload")
+    sid = store.create_session(
+        name="prod",
+        hostname="example.com",
+        port=22,
+        protocol="ssh",
+        username="root",
+        auth_type="password",
+        encrypted_credential=cred_token,
+    )
+    vault.lock()
+
+    # 1. wrong password is rejected
+    with pytest.raises(VaultAuthError):
+        vault.unlock("not-it")
+    assert not vault.is_unlocked()
+
+    # 2. correct password unlocks and persisted credentials decrypt
+    vault.unlock("first")
+    assert vault.decrypt(store.get_session(sid).encrypted_credential) == "payload"
+
+    # rotate
+    vault.change_password("first", "second")
+    vault.lock()
+
+    # 3. old password no longer works
+    with pytest.raises(VaultAuthError):
+        vault.unlock("first")
+    assert not vault.is_unlocked()
+
+    # 4. new password unlocks and pre-rotation credential still decrypts
+    vault.unlock("second")
+    assert vault.decrypt(store.get_session(sid).encrypted_credential) == "payload"
+
+
+def test_change_password_rejects_wrong_current(vault: CredentialVault) -> None:
+    """``change_password`` must reject an incorrect current password and
+    leave the vault state untouched (caller can retry).
+    """
+    vault.initialize("real")
+    token = vault.encrypt("data")
+
+    with pytest.raises(VaultAuthError):
+        vault.change_password("wrong", "new")
+
+    # Still on the original password.
+    vault.lock()
+    with pytest.raises(VaultAuthError):
+        vault.unlock("new")
+    vault.unlock("real")
+    assert vault.decrypt(token) == "data"
+
+
 def test_export_import_bundle(vault: CredentialVault) -> None:
     vault.initialize("x")
     bundle = vault.export_bundle({"a": "1", "b": "2"}, passphrase="abc")

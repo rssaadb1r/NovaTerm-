@@ -923,7 +923,7 @@ class MainWindow(QMainWindow):
 
     def _on_settings(self) -> None:
         """Open the settings dialog and reload local config on accept."""
-        dlg = SettingsDialog(self)
+        dlg = SettingsDialog(self, vault=self._vault)
         if dlg.exec() == dlg.DialogCode.Accepted:
             self._settings = load_settings()
 

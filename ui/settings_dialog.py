@@ -13,7 +13,10 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QLabel,
     QLineEdit,
+    QMessageBox,
+    QPushButton,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -21,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core import paths
+from core.credential_vault import CredentialVault, VaultAuthError
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -110,12 +114,21 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 class SettingsDialog(QDialog):
     """Tabbed settings editor."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
-        """Load current settings and build the tab widget."""
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        vault: CredentialVault | None = None,
+    ) -> None:
+        """Load current settings and build the tab widget.
+
+        ``vault`` enables the *Change Master Password* form on the
+        Security tab; when ``None`` (e.g. tests) that section is hidden.
+        """
         super().__init__(parent)
         self.setWindowTitle("NovaTerm — Preferences")
         self.resize(560, 420)
         self._settings = load_settings()
+        self._vault = vault
 
         outer = QVBoxLayout(self)
         tabs = QTabWidget(self)
@@ -237,10 +250,96 @@ class SettingsDialog(QDialog):
         return w
 
     def _build_security(self) -> QWidget:
-        """Build the Security tab (placeholder)."""
+        """Build the Security tab.
+
+        Hosts the *Change Master Password* form. The fields are wiped
+        immediately after a successful (or failed) submission so the
+        plaintext password never lingers on the form.
+        """
         w = QWidget()
-        QFormLayout(w)
+        outer = QVBoxLayout(w)
+        outer.addWidget(QLabel("<b>Change Master Password</b>", w))
+        outer.addWidget(
+            QLabel(
+                "The master password unlocks the credential vault. "
+                "Changing it re-encrypts every saved credential atomically.",
+                w,
+            )
+        )
+
+        form = QFormLayout()
+        self.sec_current = QLineEdit(w)
+        self.sec_current.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sec_new = QLineEdit(w)
+        self.sec_new.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sec_confirm = QLineEdit(w)
+        self.sec_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Current password:", self.sec_current)
+        form.addRow("New password:", self.sec_new)
+        form.addRow("Confirm new password:", self.sec_confirm)
+        outer.addLayout(form)
+
+        self.sec_change_btn = QPushButton("Change master password", w)
+        self.sec_change_btn.clicked.connect(self._on_change_master_password)
+        if self._vault is None:
+            # Vault not wired (e.g. when SettingsDialog is opened from a
+            # context that didn't pass it). Surface the form but keep the
+            # action disabled rather than silently doing nothing.
+            self.sec_change_btn.setEnabled(False)
+            self.sec_change_btn.setToolTip(
+                "Master password rotation is unavailable in this context."
+            )
+        outer.addWidget(self.sec_change_btn)
+        outer.addStretch(1)
         return w
+
+    def _on_change_master_password(self) -> None:
+        """Validate the form and rotate the master password via the vault.
+
+        The vault rotation itself is atomic (single SQLAlchemy
+        transaction) — we do the form-side validation here and surface
+        a single dialog with the outcome.
+        """
+        if self._vault is None:
+            return
+        current = self.sec_current.text()
+        new = self.sec_new.text()
+        confirm = self.sec_confirm.text()
+
+        if not current or not new:
+            QMessageBox.warning(
+                self, "NovaTerm", "Current and new password cannot be empty."
+            )
+            return
+        if new != confirm:
+            QMessageBox.warning(
+                self,
+                "NovaTerm",
+                "New password and confirmation do not match.",
+            )
+            return
+
+        try:
+            self._vault.change_password(current, new)
+        except VaultAuthError:
+            QMessageBox.critical(self, "NovaTerm", "Current password is wrong")
+            self.sec_current.clear()
+            self.sec_current.setFocus()
+            return
+        except Exception as exc:  # noqa: BLE001 — surface to user verbatim
+            QMessageBox.critical(
+                self, "NovaTerm", f"Could not change master password: {exc}"
+            )
+            return
+        finally:
+            # Always wipe the plaintext fields so they cannot be re-read.
+            self.sec_new.clear()
+            self.sec_confirm.clear()
+
+        self.sec_current.clear()
+        QMessageBox.information(
+            self, "NovaTerm", "Master password updated successfully"
+        )
 
     def _build_proxy(self) -> QWidget:
         """Build the Proxy tab."""

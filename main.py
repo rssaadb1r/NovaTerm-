@@ -11,42 +11,38 @@ import sys
 from typing import Optional
 
 import qasync
-from PyQt6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from core.command_store import CommandStore
 from core.credential_vault import CredentialVault, VaultAuthError
 from core.session_store import SessionStore
 from ui.main_window import MainWindow
+from ui.master_password_dialog import (
+    SetMasterPasswordDialog,
+    UnlockMasterPasswordDialog,
+)
 
 
 def _prompt_master_password(vault: CredentialVault, app: QApplication) -> bool:
     """Walk the user through master-password creation/unlock.
 
-    Returns ``True`` on success, ``False`` if the user cancelled.
+    Returns ``True`` on success, ``False`` if the user cancelled. The
+    master password is held only on the local Python stack and never
+    logged or persisted in plaintext (see CLAUDE.md §6).
     """
     if not vault.is_initialized():
-        text, ok = QInputDialog.getText(
-            None,
-            "NovaTerm — Set master password",
-            "Choose a master password to encrypt saved credentials:",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok or not text:
+        dlg = SetMasterPasswordDialog()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return False
-        vault.initialize(text)
+        vault.initialize(dlg.password())
         return True
 
     for _ in range(3):
-        text, ok = QInputDialog.getText(
-            None,
-            "NovaTerm — Master password",
-            "Enter your master password:",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok:
+        dlg = UnlockMasterPasswordDialog()
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return False
         try:
-            vault.unlock(text)
+            vault.unlock(dlg.password())
             return True
         except VaultAuthError:
             QMessageBox.warning(None, "NovaTerm", "Wrong password — try again.")
