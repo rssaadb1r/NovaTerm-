@@ -1,0 +1,13 @@
+PyQt6>=6.6
+qasync>=0.27
+paramiko>=3.4
+telnetlib3>=2.0.4
+cryptography>=42.0
+bcrypt>=4.1
+SQLAlchemy>=2.0
+platformdirs>=4.2
+tomli-w>=1.0
+pyte>=0.8.2
+pytest>=8.0
+pytest-qt>=4.4
+pytest-asyncio>=0.23
