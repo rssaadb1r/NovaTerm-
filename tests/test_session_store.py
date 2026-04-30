@@ -75,3 +75,40 @@ def test_master_auth_replace(store: SessionStore) -> None:
     row = store.get_master_auth()
     assert row is not None
     assert row.kdf_salt == b"saltB"
+
+
+def test_default_session_lazy_create_and_update(store: SessionStore) -> None:
+    """Reading the default session before it exists creates the singleton."""
+    row = store.get_default_session()
+    assert row.id == 1
+    assert row.username is None
+    assert row.port == 22
+
+    store.update_default_session(username="root", port=2222, protocol="ssh")
+    row = store.get_default_session()
+    assert row.username == "root"
+    assert row.port == 2222
+
+
+def test_folder_expand_state_persists(store: SessionStore) -> None:
+    fid = store.create_folder("Production")
+    # Default is expanded.
+    assert next(f for f in store.list_folders() if f.id == fid).is_expanded is True
+    store.set_folder_expanded(fid, False)
+    assert next(f for f in store.list_folders() if f.id == fid).is_expanded is False
+
+
+def test_folder_rename_and_delete_reparents_sessions(store: SessionStore) -> None:
+    fid = store.create_folder("Old name")
+    sid = store.create_session(
+        name="srv", hostname="h", port=22, protocol="ssh", folder_id=fid
+    )
+    store.update_folder(fid, name="New name")
+    assert next(f for f in store.list_folders() if f.id == fid).name == "New name"
+
+    store.delete_folder(fid)
+    # Session falls back to top-level (folder_id NULL) rather than being deleted.
+    sess = store.get_session(sid)
+    assert sess is not None
+    assert sess.folder_id is None
+    assert all(f.id != fid for f in store.list_folders())

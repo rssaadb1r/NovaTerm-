@@ -10,7 +10,7 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,9 @@ class Folder(Base):
         ForeignKey("folders.id", ondelete="SET NULL"), nullable=True
     )
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Whether the user had this folder expanded last time the sidebar
+    # was rendered. Persisted so the tree state survives app restarts.
+    is_expanded: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     # Self-referential tree: define the many-to-one ``parent`` side with
     # ``remote_side=[id]`` so SQLAlchemy auto-generates the inverse
@@ -171,6 +174,41 @@ class RecentConnection(Base):
     )
 
 
+class DefaultSession(Base):
+    """Singleton row holding the *Default Session* (global profile).
+
+    Inspired by SecureCRT's Default Session: any new connection that does
+    not have its own saved credentials inherits these values. Stored as
+    a regular row (with a fixed primary key of ``1``) rather than scattered
+    across the settings TOML so we can encrypt the password through the
+    same :class:`~core.credential_vault.CredentialVault` as per-session
+    credentials.
+    """
+
+    __tablename__ = "default_session"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    encrypted_password: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    key_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    encrypted_key_passphrase: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    port: Mapped[int] = mapped_column(Integer, default=22, nullable=False)
+    protocol: Mapped[str] = mapped_column(String(16), default="ssh", nullable=False)
+
+    color_scheme: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    font_family: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    font_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scrollback_lines: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+
 class MasterAuth(Base):
     """Single-row table holding the master-password bcrypt hash + salt.
 
@@ -274,6 +312,65 @@ class SessionStore:
         """Return every folder ordered by ``sort_order`` then name."""
         with self.session() as s:
             return list(s.scalars(select(Folder).order_by(Folder.sort_order, Folder.name)))
+
+    def update_folder(self, folder_id: int, **fields: Any) -> None:
+        """Update fields on an existing folder row."""
+        with self.session() as s:
+            row = s.get(Folder, folder_id)
+            if row is None:
+                raise KeyError(f"Folder id={folder_id} not found")
+            for k, v in fields.items():
+                setattr(row, k, v)
+
+    def delete_folder(self, folder_id: int) -> None:
+        """Delete a folder; sessions in it have their ``folder_id`` cleared."""
+        with self.session() as s:
+            row = s.get(Folder, folder_id)
+            if row is None:
+                return
+            for sess_row in s.scalars(
+                select(Session).where(Session.folder_id == folder_id)
+            ):
+                sess_row.folder_id = None
+            for child in s.scalars(
+                select(Folder).where(Folder.parent_id == folder_id)
+            ):
+                child.parent_id = row.parent_id
+            s.delete(row)
+
+    def set_folder_expanded(self, folder_id: int, expanded: bool) -> None:
+        """Persist the expand/collapse state for a folder."""
+        with self.session() as s:
+            row = s.get(Folder, folder_id)
+            if row is not None:
+                row.is_expanded = bool(expanded)
+
+    # -- default session ---------------------------------------------------
+
+    def get_default_session(self) -> DefaultSession:
+        """Return the singleton default-session row, creating it on first use.
+
+        The row is created lazily so a fresh DB doesn't need a separate
+        bootstrap step before the UI can read or display the defaults.
+        """
+        with self.session() as s:
+            row = s.get(DefaultSession, 1)
+            if row is None:
+                row = DefaultSession(id=1)
+                s.add(row)
+                s.flush()
+            return row
+
+    def update_default_session(self, **fields: Any) -> None:
+        """Update the default-session row in-place (creating it if missing)."""
+        with self.session() as s:
+            row = s.get(DefaultSession, 1)
+            if row is None:
+                row = DefaultSession(id=1)
+                s.add(row)
+            for k, v in fields.items():
+                setattr(row, k, v)
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # -- session CRUD ------------------------------------------------------
 

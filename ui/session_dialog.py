@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.session_store import Session, SessionStore
+from core.session_store import DefaultSession, Session, SessionStore
 
 from .colors import GROUP_PRESETS, PALETTE
 
@@ -33,12 +33,19 @@ class SessionDialog(QDialog):
         store: SessionStore,
         existing: Session | None = None,
         parent: QWidget | None = None,
+        *,
+        default_folder_id: int | None = None,
     ) -> None:
-        """Build a tabbed dialog and pre-fill from ``existing`` if provided."""
+        """Build a tabbed dialog and pre-fill from ``existing`` if provided.
+
+        :param default_folder_id: When creating a *new* session, the folder
+            the user right-clicked on (so the picker pre-selects it).
+        """
         super().__init__(parent)
         self.setWindowTitle("Edit session" if existing else "New session")
         self._store = store
         self._existing = existing
+        self._default_session: DefaultSession = store.get_default_session()
         self.resize(560, 480)
 
         outer = QVBoxLayout(self)
@@ -49,11 +56,23 @@ class SessionDialog(QDialog):
         conn = QFormLayout(conn_w)
         self.name = QLineEdit(conn_w)
         self.hostname = QLineEdit(conn_w)
+        self.folder = QComboBox(conn_w)
+        self.folder.addItem("(top level)", None)
+        for f in store.list_folders():
+            self.folder.addItem(f.name, f.id)
+        if default_folder_id is not None:
+            idx = self.folder.findData(default_folder_id)
+            if idx >= 0:
+                self.folder.setCurrentIndex(idx)
         self.port = QSpinBox(conn_w)
         self.port.setRange(1, 65_535)
-        self.port.setValue(22)
+        self.port.setValue(self._default_session.port or 22)
         self.protocol = QComboBox(conn_w)
         self.protocol.addItems(["ssh", "telnet", "serial"])
+        if self._default_session.protocol:
+            i = self.protocol.findText(self._default_session.protocol)
+            if i >= 0:
+                self.protocol.setCurrentIndex(i)
         self.username = QLineEdit(conn_w)
         self.auth_type = QComboBox(conn_w)
         self.auth_type.addItems(["password", "key", "ask"])
@@ -62,15 +81,39 @@ class SessionDialog(QDialog):
         self.key_path = QLineEdit(conn_w)
         self.key_passphrase = QLineEdit(conn_w)
         self.key_passphrase.setEchoMode(QLineEdit.EchoMode.Password)
+        self._username_hint = _DefaultHint(
+            f"using default ({self._default_session.username})"
+            if self._default_session.username
+            else "using default (none)"
+        )
+        self._key_path_hint = _DefaultHint(
+            f"using default ({self._default_session.key_path})"
+            if self._default_session.key_path
+            else "using default (none)"
+        )
+        self._port_hint = _DefaultHint(
+            f"default {self._default_session.port or 22}"
+        )
+        self.username.textChanged.connect(
+            lambda t: self._username_hint.setVisible(not bool(t.strip()))
+        )
+        self.key_path.textChanged.connect(
+            lambda t: self._key_path_hint.setVisible(not bool(t.strip()))
+        )
         conn.addRow("Name:", self.name)
+        conn.addRow("Folder:", self.folder)
         conn.addRow("Hostname:", self.hostname)
-        conn.addRow("Port:", self.port)
+        conn.addRow("Port:", _row_with_hint(self.port, self._port_hint))
         conn.addRow("Protocol:", self.protocol)
-        conn.addRow("Username:", self.username)
+        conn.addRow("Username:", _row_with_hint(self.username, self._username_hint))
         conn.addRow("Auth type:", self.auth_type)
         conn.addRow("Password:", self.password)
-        conn.addRow("Key file:", self.key_path)
+        conn.addRow("Key file:", _row_with_hint(self.key_path, self._key_path_hint))
         conn.addRow("Key passphrase:", self.key_passphrase)
+        # Initial visibility of "using default" hints based on the
+        # currently-empty fields.
+        self._username_hint.setVisible(True)
+        self._key_path_hint.setVisible(True)
         tabs.addTab(conn_w, "Connection")
 
         # -------- Jump host chain tab ----------------------------------
@@ -168,6 +211,9 @@ class SessionDialog(QDialog):
         """Fill the form from an existing :class:`Session`."""
         self.name.setText(sess.name)
         self.hostname.setText(sess.hostname or "")
+        idx = self.folder.findData(sess.folder_id)
+        if idx >= 0:
+            self.folder.setCurrentIndex(idx)
         self.port.setValue(sess.port or 22)
         idx = self.protocol.findText(sess.protocol or "ssh")
         if idx >= 0:
@@ -209,6 +255,7 @@ class SessionDialog(QDialog):
 
         return {
             "name": self.name.text().strip() or "Untitled",
+            "folder_id": self.folder.currentData(),
             "hostname": self.hostname.text().strip(),
             "port": int(self.port.value()),
             "protocol": self.protocol.currentText(),
@@ -226,3 +273,25 @@ class SessionDialog(QDialog):
             "notes": self.notes.toPlainText().strip() or None,
             "jump_host_chain": chain,
         }
+
+
+class _DefaultHint(QLabel):
+    """Small italicised label shown next to empty fields.
+
+    Lets the user see at a glance which value will be inherited from the
+    Default Session if they leave the input blank.
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+
+
+def _row_with_hint(field: QWidget, hint: QLabel) -> QWidget:
+    """Return a horizontal row containing ``field`` plus a trailing hint."""
+    box = QWidget()
+    h = QHBoxLayout(box)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.addWidget(field, 1)
+    h.addWidget(hint, 0)
+    return box

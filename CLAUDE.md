@@ -119,7 +119,10 @@ Build order (must compile/test in this sequence):
 |                    | jump_host_chain (JSON list of BastionProfile.id), color_tag, group_tag, |
 |                    | notes, log_enabled, log_path, log_mode, color_scheme, font_family,      |
 |                    | font_size, created_at, last_connected_at                                |
-| `Folder`           | name, parent_id (self-FK, nullable), sort_order                         |
+| `Folder`           | name, parent_id (self-FK, nullable), sort_order, is_expanded            |
+| `DefaultSession`   | singleton (id=1) global profile: username, encrypted_password,          |
+|                    | key_path, encrypted_key_passphrase, port, protocol, color_scheme,       |
+|                    | font_family, font_size, scrollback_lines, updated_at                    |
 | `BastionProfile`   | name, hostname, port, username, auth_type, encrypted_credential,        |
 |                    | key_path                                                                |
 | `Command`          | group_id, name, command_text, description, tags (JSON), hotkey         |
@@ -220,3 +223,12 @@ These are documented per the spec's instruction to record any deviations.
 6. **`platformdirs`** is used for config/data/log paths — no hardcoded paths.
 7. **Qt private-API avoidance.** Splits, detached tabs, and find-bar overlays
    are implemented purely with public PyQt6 API.
+8. **Default Session (SecureCRT-style global profile).** Stored as a singleton
+   row in the new `default_session` table rather than scattered across the
+   settings TOML, so the password / key passphrase can be encrypted through
+   the same `CredentialVault` as per-session credentials. Saved sessions
+   inherit any field they leave blank from this row at connect time, and the
+   toolbar Quick Host Bar uses these values to authenticate without prompting.
+9. **Folder expand-state persistence.** `Folder.is_expanded` lives on the row
+   itself rather than in a separate UI-state table — it's a single bool and
+   the sidebar is the only consumer.

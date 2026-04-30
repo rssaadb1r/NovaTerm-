@@ -29,6 +29,7 @@ from core.ssh_client import AsyncSSHClient, HopConfig, SSHConnectConfig
 
 from .cluster_bar import ClusterInputBar, ClusterSelectDialog
 from .command_manager import CommandFuzzyPopup, CommandManagerPanel
+from .default_session_dialog import DefaultSessionDialog
 from .quick_connect import QuickConnectDialog
 from .session_dialog import SessionDialog
 from .session_manager import SessionManagerPanel
@@ -86,6 +87,9 @@ class MainWindow(QMainWindow):
         self._sidebar.session_edit_requested.connect(self._on_edit_session)
         self._sidebar.session_clone_requested.connect(self._on_clone_session)
         self._sidebar.session_delete_requested.connect(self._on_delete_session)
+        self._sidebar.default_session_edit_requested.connect(
+            self._on_edit_default_session
+        )
         self._splitter.addWidget(self._sidebar)
 
         self._tabs = NovaTabWidget(self)
@@ -148,6 +152,11 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._make_action("Find in Terminal…", self._on_find, "Ctrl+F"))
         edit_menu.addAction(self._make_action("Settings…", self._on_settings, "Ctrl+,"))
 
+        opt_menu = mb.addMenu("&Options")
+        opt_menu.addAction(
+            self._make_action("Default Session…", self._on_edit_default_session)
+        )
+
         view_menu = mb.addMenu("&View")
         view_menu.addAction(
             self._make_action("Toggle Session Manager", self._toggle_sidebar)
@@ -167,6 +176,19 @@ class MainWindow(QMainWindow):
         bar.addAction(self._make_action("SFTP", self._on_open_sftp))
         bar.addAction(self._make_action("Find", self._on_find))
         bar.addAction(self._make_action("Settings", self._on_settings))
+        bar.addAction(
+            self._make_action("Default Session…", self._on_edit_default_session)
+        )
+
+        # SecureCRT-style Quick Host Bar: type a hostname, click Connect,
+        # the Default Session credentials are used automatically.
+        bar.addSeparator()
+        self._host_bar = QLineEdit(self)
+        self._host_bar.setPlaceholderText("hostname…")
+        self._host_bar.setMinimumWidth(220)
+        self._host_bar.returnPressed.connect(self._on_host_bar_connect)
+        bar.addWidget(self._host_bar)
+        bar.addAction(self._make_action("Connect", self._on_host_bar_connect))
 
     def _install_shortcuts(self) -> None:
         """Install global QShortcut bindings (see CLAUDE.md §9)."""
@@ -367,14 +389,105 @@ class MainWindow(QMainWindow):
                 jumps=[],
             )
 
-    def _on_new_session(self) -> None:
-        """Open the New Session dialog and persist on Ok."""
-        dlg = SessionDialog(self._store, parent=self)
+    def _on_new_session(self, folder_id: object | None = None) -> None:
+        """Open the New Session dialog and persist on Ok.
+
+        :param folder_id: Optional folder id passed from the sidebar context
+            menu so the new session pre-targets the folder the user clicked.
+        """
+        target_folder = (
+            int(folder_id) if isinstance(folder_id, int) and folder_id > 0 else None
+        )
+        dlg = SessionDialog(
+            self._store, parent=self, default_folder_id=target_folder
+        )
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
         fields = dlg.fields()
         self._store.create_session(**fields)
         self._sidebar.refresh()
+
+    def _on_edit_default_session(self) -> None:
+        """Open the Default Session editor."""
+        dlg = DefaultSessionDialog(self._store, self._vault, self)
+        dlg.exec()
+        # The session editor pulls the latest defaults each time it opens,
+        # so no extra refresh is needed here.
+
+    def _on_host_bar_connect(self) -> None:
+        """Connect to the hostname typed in the toolbar Quick Host Bar.
+
+        Uses the Default Session username / password / port / protocol
+        (decrypting the saved password through the vault when unlocked).
+        If the connection fails on the first attempt the Quick Connect
+        dialog is opened pre-filled with the typed hostname so the user
+        can override credentials interactively.
+        """
+        host = self._host_bar.text().strip()
+        if not host:
+            return
+        defaults = self._store.get_default_session()
+        password: str | None = None
+        if (
+            defaults.encrypted_password is not None
+            and self._vault.is_unlocked()
+        ):
+            try:
+                password = self._vault.decrypt(defaults.encrypted_password)
+            except VaultAuthError:
+                password = None
+
+        username = defaults.username or None
+        port = defaults.port or 22
+        protocol = defaults.protocol or "ssh"
+        label = f"{username}@{host}" if username else host
+        content = self._new_terminal_tab(
+            session_id=None, name=label, color_tag=None
+        )
+        self._store.add_recent_connection(host, port, protocol, username)
+        if protocol == "ssh":
+            self._connect_ssh(
+                content,
+                hostname=host,
+                port=port,
+                username=username,
+                password=password,
+                jumps=[],
+                on_failure=lambda: self._open_quick_connect_with_host(host),
+            )
+        self._host_bar.clear()
+
+    def _open_quick_connect_with_host(self, host: str) -> None:
+        """Open the Quick Connect dialog pre-filled with ``host``.
+
+        Used as the fallback when a Default-Session-driven connection from
+        the toolbar Quick Host Bar fails.
+        """
+        dlg = QuickConnectDialog(self._store, self)
+        if hasattr(dlg, "hostname"):
+            dlg.hostname.setText(host)  # type: ignore[attr-defined]
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        data = dlg.result_data()
+        if not data.hostname:
+            return
+        content = self._new_terminal_tab(
+            session_id=None,
+            name=f"{data.username}@{data.hostname}" if data.username else data.hostname,
+            color_tag=None,
+        )
+        self._store.add_recent_connection(
+            data.hostname, data.port, data.protocol, data.username or None
+        )
+        if data.protocol == "ssh":
+            self._connect_ssh(
+                content,
+                hostname=data.hostname,
+                port=data.port,
+                username=data.username,
+                password=None,
+                jumps=[],
+            )
 
     def _on_edit_session(self, sid: int) -> None:
         """Edit an existing session row."""
@@ -469,12 +582,23 @@ class MainWindow(QMainWindow):
                     password = self._vault.decrypt(sess.encrypted_credential)
                 except VaultAuthError:
                     password = None
+
+            # Default Session fallback — inherit any field the saved session
+            # leaves blank (Feature: SecureCRT-style Default Session).
+            defaults = self._store.get_default_session()
+            username = sess.username or defaults.username or ""
+            if password is None and self._vault.is_unlocked() and defaults.encrypted_password:
+                try:
+                    password = self._vault.decrypt(defaults.encrypted_password)
+                except VaultAuthError:
+                    password = None
+
             jumps = self._resolve_jump_chain(sess.jump_host_chain or [])
             self._connect_ssh(
                 content,
                 hostname=sess.hostname,
                 port=sess.port,
-                username=sess.username or "",
+                username=username,
                 password=password,
                 jumps=jumps,
             )
@@ -522,11 +646,16 @@ class MainWindow(QMainWindow):
         username: str | None,
         password: str | None,
         jumps: list[HopConfig] | None = None,
+        on_failure: Any = None,
     ) -> None:
         """Spawn the asyncio task that brings up the SSH connection.
 
         ``jumps`` is an ordered list of :class:`HopConfig` describing the
         ProxyJump chain (resolved from the session's ``jump_host_chain``).
+        ``on_failure`` is an optional zero-arg callable invoked on the Qt
+        main thread when the *initial* ``client.connect`` raises — used
+        by the toolbar Quick Host Bar to fall back to the Quick Connect
+        dialog when the Default Session credentials don't authenticate.
         """
         config = SSHConnectConfig(
             target=HopConfig(
@@ -545,6 +674,7 @@ class MainWindow(QMainWindow):
 
         async def _runner() -> None:
             terminal = content.terminal()
+            connect_failed = False
             try:
                 # ``progress`` is invoked on the main loop (see ssh_client.py).
                 await client.connect(progress=lambda m: self.statusBar().showMessage(m))
@@ -559,8 +689,11 @@ class MainWindow(QMainWindow):
                 logger.exception("SSH session failed")
                 self._set_status_for_content(content, ERROR)
                 terminal.append_output(f"\r\n[novaterm] connection error: {exc}\r\n")
+                connect_failed = True
             finally:
                 self._set_status_for_content(content, DISCONNECTED)
+            if connect_failed and on_failure is not None:
+                on_failure()
 
         asyncio.ensure_future(_runner())
 
