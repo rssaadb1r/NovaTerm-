@@ -75,16 +75,34 @@ class AsyncSSHClient:
     async def connect(self, progress: ProgressCallback | None = None) -> None:
         """Connect to the target through any configured jump hops.
 
-        :param progress: Optional callable invoked with human-readable status
-            strings — used by the UI to render the hop-by-hop status dialog.
+        :param progress: Optional callable invoked (on the asyncio/Qt main
+            loop) with human-readable status strings — used by the UI to
+            render the hop-by-hop status dialog. The callback is dispatched
+            via ``loop.call_soon_threadsafe`` so it is always run on the
+            main thread, even though the SSH handshake itself happens on
+            a worker thread.
         """
         loop = asyncio.get_event_loop()
+        # Wrap the user-supplied progress callback so it runs on the main loop.
+        if progress is None:
+            wrapped: ProgressCallback | None = None
+        else:
+            def wrapped(msg: str, _loop: asyncio.AbstractEventLoop = loop, _cb: ProgressCallback = progress) -> None:
+                _loop.call_soon_threadsafe(self._dispatch_progress, _cb, msg)
+
         try:
-            await loop.run_in_executor(None, self._connect_sync, progress)
+            await loop.run_in_executor(None, self._connect_sync, wrapped)
         except Exception as exc:
             logger.exception("SSH connection failed")
             raise SSHConnectionError(str(exc)) from exc
         self._connected = True
+
+    @staticmethod
+    def _dispatch_progress(cb: ProgressCallback, msg: str) -> None:
+        """Run ``cb`` on the main loop and forward awaitable results."""
+        result = cb(msg)
+        if asyncio.iscoroutine(result):
+            asyncio.ensure_future(result)
 
     async def write(self, data: bytes) -> None:
         """Send raw bytes to the remote shell."""
@@ -113,13 +131,15 @@ class AsyncSSHClient:
     # -- internals ---------------------------------------------------------
 
     def _emit(self, progress: ProgressCallback | None, msg: str) -> None:
-        """Helper: invoke the progress callback (sync or async)."""
+        """Helper: invoke the (already main-loop-marshalled) progress callback.
+
+        ``progress`` here is the wrapped callback set up in :meth:`connect`,
+        which is safe to invoke from any thread (it forwards to the loop).
+        """
         logger.info(msg)
         if progress is None:
             return
-        result = progress(msg)
-        if asyncio.iscoroutine(result):
-            asyncio.ensure_future(result)
+        progress(msg)
 
     def _build_kwargs(self, hop: HopConfig) -> dict[str, Any]:
         """Assemble paramiko.connect kwargs for a hop."""

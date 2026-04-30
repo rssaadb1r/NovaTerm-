@@ -63,8 +63,11 @@ class MainWindow(QMainWindow):
         self._vault = vault
         self._commands = commands
         self._settings = load_settings()
-        self._cluster_targets: set[int] = set()
-        self._ssh_clients: dict[int, AsyncSSHClient] = {}  # tab_index -> client
+        # Cluster target set & SSH clients are keyed by ``TabContent`` rather
+        # than by tab index — the index changes when tabs are closed,
+        # detached, or reordered, but the widget object is stable.
+        self._cluster_targets: set[TabContent] = set()
+        self._ssh_clients: dict[TabContent, AsyncSSHClient] = {}
 
         # -- central layout ------------------------------------------------
         central = QWidget(self)
@@ -194,8 +197,8 @@ class MainWindow(QMainWindow):
         session_id: int | None,
         name: str,
         color_tag: str | None,
-    ) -> int:
-        """Create a fresh tab and return its index."""
+    ) -> TabContent:
+        """Create a fresh tab and return its :class:`TabContent` widget."""
         terminal = TerminalWidget()
         terminal.set_broadcast_callback(self._broadcast_text_from_terminal)
         content = TabContent(
@@ -206,7 +209,12 @@ class MainWindow(QMainWindow):
         )
         idx = self._tabs.add_tab(content)
         self._tabs.setCurrentIndex(idx)
-        return idx
+        return content
+
+    def _content_at(self, index: int) -> TabContent | None:
+        """Return the :class:`TabContent` at ``index``, if any."""
+        widget = self._tabs.widget(index)
+        return widget if isinstance(widget, TabContent) else None
 
     def _current_terminal(self) -> TerminalWidget | None:
         """Return the active tab's :class:`TerminalWidget`, if any."""
@@ -219,9 +227,10 @@ class MainWindow(QMainWindow):
         """Disconnect & remove the tab at ``index``."""
         if index < 0 or index >= self._tabs.count():
             return
-        widget = self._tabs.widget(index)
-        if isinstance(widget, TabContent):
-            client = self._ssh_clients.pop(index, None)
+        content = self._content_at(index)
+        if content is not None:
+            self._cluster_targets.discard(content)
+            client = self._ssh_clients.pop(content, None)
             if client is not None:
                 asyncio.ensure_future(client.disconnect())
         self._tabs.removeTab(index)
@@ -235,9 +244,11 @@ class MainWindow(QMainWindow):
 
     def _disconnect_tab(self, index: int) -> None:
         """Disconnect the SSH backend for tab ``index`` (keeps the tab open)."""
-        client = self._ssh_clients.get(index)
-        if client is not None:
-            asyncio.ensure_future(client.disconnect())
+        content = self._content_at(index)
+        if content is not None:
+            client = self._ssh_clients.get(content)
+            if client is not None:
+                asyncio.ensure_future(client.disconnect())
         self._tabs.set_tab_status(index, DISCONNECTED)
 
     def _reconnect_tab(self, index: int) -> None:
@@ -247,16 +258,29 @@ class MainWindow(QMainWindow):
             self._open_saved_session(widget.session_id)
 
     def _detach_tab(self, index: int) -> None:
-        """Move the tab into a free-floating window."""
-        widget = self._tabs.widget(index)
-        if not isinstance(widget, TabContent):
+        """Move the tab into a free-floating window.
+
+        The :class:`TabContent` widget retains its identity as it moves out of
+        the tab bar, so its entry in ``_ssh_clients`` and ``_cluster_targets``
+        remains valid — but it can no longer be addressed via the cluster
+        bar / right-click menu, so we drop it from those collections to
+        avoid 'phantom' broadcasts.
+        """
+        content = self._content_at(index)
+        if content is None:
             return
+        client = self._ssh_clients.pop(content, None)
+        self._cluster_targets.discard(content)
         self._tabs.removeTab(index)
         floating = QMainWindow()
-        floating.setWindowTitle(widget.session_name)
-        floating.setCentralWidget(widget)
+        floating.setWindowTitle(content.session_name)
+        floating.setCentralWidget(content)
         floating.resize(900, 600)
         floating.show()
+        # Keep the SSH session alive in the floating window: pin the client
+        # on the widget itself so it isn't garbage-collected.
+        if client is not None:
+            content._detached_client = client  # type: ignore[attr-defined]
 
     def _clone_tab(self, index: int) -> None:
         """Open a new tab with the same session settings."""
@@ -297,7 +321,7 @@ class MainWindow(QMainWindow):
         data = dlg.result_data()
         if not data.hostname:
             return
-        idx = self._new_terminal_tab(
+        content = self._new_terminal_tab(
             session_id=None,
             name=f"{data.username}@{data.hostname}" if data.username else data.hostname,
             color_tag=None,
@@ -316,7 +340,13 @@ class MainWindow(QMainWindow):
             data.hostname, data.port, data.protocol, data.username or None
         )
         if data.protocol == "ssh":
-            self._connect_ssh(idx, hostname=data.hostname, port=data.port, username=data.username, password=None)
+            self._connect_ssh(
+                content,
+                hostname=data.hostname,
+                port=data.port,
+                username=data.username,
+                password=None,
+            )
 
     def _on_new_session(self) -> None:
         """Open the New Session dialog and persist on Ok."""
@@ -386,7 +416,7 @@ class MainWindow(QMainWindow):
         sess = self._store.get_session(sid)
         if sess is None:
             return
-        idx = self._new_terminal_tab(
+        content = self._new_terminal_tab(
             session_id=sess.id, name=sess.name, color_tag=sess.color_tag
         )
         if sess.protocol == "ssh":
@@ -397,7 +427,7 @@ class MainWindow(QMainWindow):
                 except VaultAuthError:
                     password = None
             self._connect_ssh(
-                idx,
+                content,
                 hostname=sess.hostname,
                 port=sess.port,
                 username=sess.username or "",
@@ -407,7 +437,7 @@ class MainWindow(QMainWindow):
 
     def _connect_ssh(
         self,
-        tab_index: int,
+        content: TabContent,
         *,
         hostname: str,
         port: int,
@@ -428,36 +458,36 @@ class MainWindow(QMainWindow):
             auto_reconnect_retries=int(self._settings["advanced"]["auto_reconnect_retries"]),
         )
         client = AsyncSSHClient(config)
-        self._ssh_clients[tab_index] = client
+        self._ssh_clients[content] = client
 
         async def _runner() -> None:
-            terminal = self._terminal_at(tab_index)
+            terminal = content.terminal()
             try:
+                # ``progress`` is invoked on the main loop (see ssh_client.py).
                 await client.connect(progress=lambda m: self.statusBar().showMessage(m))
-                self._tabs.set_tab_status(tab_index, CONNECTED)
+                self._set_status_for_content(content, CONNECTED)
                 terminal_signal_pipe(terminal, client)
                 while client.connected:
                     chunk = await client.read(4096)
                     if not chunk:
                         break
-                    if terminal is not None:
-                        terminal.append_output(chunk.decode("utf-8", errors="replace"))
+                    terminal.append_output(chunk.decode("utf-8", errors="replace"))
             except Exception as exc:
                 logger.exception("SSH session failed")
-                self._tabs.set_tab_status(tab_index, ERROR)
-                if terminal is not None:
-                    terminal.append_output(f"\r\n[novaterm] connection error: {exc}\r\n")
+                self._set_status_for_content(content, ERROR)
+                terminal.append_output(f"\r\n[novaterm] connection error: {exc}\r\n")
             finally:
-                self._tabs.set_tab_status(tab_index, DISCONNECTED)
+                self._set_status_for_content(content, DISCONNECTED)
 
         asyncio.ensure_future(_runner())
 
-    def _terminal_at(self, tab_index: int) -> TerminalWidget | None:
-        """Return the :class:`TerminalWidget` at ``tab_index`` (None if gone)."""
-        widget = self._tabs.widget(tab_index)
-        if isinstance(widget, TabContent):
-            return widget.terminal()
-        return None
+    def _set_status_for_content(self, content: TabContent, status: str) -> None:
+        """Update the status dot for a tab, looking up its current index."""
+        idx = self._tabs.indexOf(content)
+        if idx >= 0:
+            self._tabs.set_tab_status(idx, status)
+
+
 
     # ------------------------------------------------------------------
     # Cluster send
@@ -465,17 +495,18 @@ class MainWindow(QMainWindow):
 
     def _on_open_cluster(self) -> None:
         """Open the dialog letting the user pick cluster targets."""
-        tabs = []
+        tabs: list[tuple[TabContent, str]] = []
         for i in range(self._tabs.count()):
-            w = self._tabs.widget(i)
-            if isinstance(w, TabContent):
-                tabs.append((i, w.session_name))
+            content = self._content_at(i)
+            if content is not None:
+                tabs.append((content, content.session_name))
         dlg = ClusterSelectDialog(tabs, self._cluster_targets, self)
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
         self._cluster_targets = dlg.selected()
         for i in range(self._tabs.count()):
-            self._tabs.set_broadcast_indicator(i, i in self._cluster_targets)
+            content = self._content_at(i)
+            self._tabs.set_broadcast_indicator(i, content in self._cluster_targets)
         if self._cluster_targets:
             self._cluster_bar.show()
             self._cluster_bar.focus()
@@ -484,24 +515,25 @@ class MainWindow(QMainWindow):
 
     def _toggle_cluster_off(self) -> None:
         """Disable cluster mode."""
-        for i in self._cluster_targets:
-            self._tabs.set_broadcast_indicator(i, False)
+        for content in self._cluster_targets:
+            idx = self._tabs.indexOf(content)
+            if idx >= 0:
+                self._tabs.set_broadcast_indicator(idx, False)
         self._cluster_targets.clear()
         self._cluster_bar.hide()
 
     def _broadcast_chars(self, chunk: str) -> None:
         """Forward a typed chunk to all cluster targets."""
-        for i in list(self._cluster_targets):
-            client = self._ssh_clients.get(i)
+        for content in list(self._cluster_targets):
+            client = self._ssh_clients.get(content)
             if client is None or not client.connected:
                 continue
             asyncio.ensure_future(client.write(chunk.encode("utf-8")))
 
     def _broadcast_text_from_terminal(self, text: str) -> None:
         """Slot for terminal "Send to All" right-click action."""
-        for i in range(self._tabs.count()):
-            client = self._ssh_clients.get(i)
-            if client is None or not client.connected:
+        for client in list(self._ssh_clients.values()):
+            if not client.connected:
                 continue
             asyncio.ensure_future(client.write(text.encode("utf-8")))
 
@@ -509,35 +541,35 @@ class MainWindow(QMainWindow):
     # Command Manager send
     # ------------------------------------------------------------------
 
+    def _resolve_session_vars(self, content: TabContent) -> tuple[str | None, str | None, str | None]:
+        """Look up ``(hostname, username, session_name)`` for a tab's session."""
+        if content.session_id is None:
+            return None, None, content.session_name
+        sess = self._store.get_session(content.session_id)
+        if sess is None:
+            return None, None, content.session_name
+        return sess.hostname, sess.username, sess.name
+
     def _send_command_to_active(self, text: str, append_enter: bool) -> None:
         """Send a command to the active tab only."""
-        idx = self._tabs.currentIndex()
-        client = self._ssh_clients.get(idx)
-        sess_widget = self._tabs.widget(idx)
-        host = user = sess_name = None
-        if isinstance(sess_widget, TabContent) and sess_widget.session_id is not None:
-            sess = self._store.get_session(sess_widget.session_id)
-            if sess is not None:
-                host, user, sess_name = sess.hostname, sess.username, sess.name
-        text = substitute_variables(text, hostname=host, username=user, session_name=sess_name)
-        if append_enter:
-            text += "\n"
+        content = self._content_at(self._tabs.currentIndex())
+        if content is None:
+            return
+        client = self._ssh_clients.get(content)
         if client is None or not client.connected:
             return
-        asyncio.ensure_future(client.write(text.encode("utf-8")))
+        host, user, sess_name = self._resolve_session_vars(content)
+        payload = substitute_variables(text, hostname=host, username=user, session_name=sess_name)
+        if append_enter:
+            payload += "\n"
+        asyncio.ensure_future(client.write(payload.encode("utf-8")))
 
     def _send_command_to_all(self, text: str, append_enter: bool) -> None:
         """Send a command to every connected tab."""
-        for i in range(self._tabs.count()):
-            client = self._ssh_clients.get(i)
-            if client is None or not client.connected:
+        for content, client in list(self._ssh_clients.items()):
+            if not client.connected:
                 continue
-            sess_widget = self._tabs.widget(i)
-            host = user = sess_name = None
-            if isinstance(sess_widget, TabContent) and sess_widget.session_id is not None:
-                sess = self._store.get_session(sess_widget.session_id)
-                if sess is not None:
-                    host, user, sess_name = sess.hostname, sess.username, sess.name
+            host, user, sess_name = self._resolve_session_vars(content)
             payload = substitute_variables(text, hostname=host, username=user, session_name=sess_name)
             if append_enter:
                 payload += "\n"
@@ -555,8 +587,8 @@ class MainWindow(QMainWindow):
 
     def _on_open_sftp(self) -> None:
         """Open an SFTP panel for the current SSH connection."""
-        idx = self._tabs.currentIndex()
-        client = self._ssh_clients.get(idx)
+        content = self._content_at(self._tabs.currentIndex())
+        client = self._ssh_clients.get(content) if content is not None else None
         if client is None or not client.connected:
             QMessageBox.warning(self, "SFTP", "Connect to an SSH session first.")
             return

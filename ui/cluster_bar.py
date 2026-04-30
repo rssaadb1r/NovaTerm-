@@ -1,6 +1,8 @@
 """Cluster Send input bar + selection dialog (Feature 7)."""
 from __future__ import annotations
 
+from typing import Hashable, Iterable, TypeVar
+
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
@@ -14,6 +16,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+K = TypeVar("K", bound=Hashable)
 
 
 class ClusterInputBar(QWidget):
@@ -64,11 +68,16 @@ class ClusterSelectDialog(QDialog):
 
     def __init__(
         self,
-        tabs: list[tuple[int, str]],
-        already_selected: set[int] | None = None,
+        tabs: Iterable[tuple[Hashable, str]],
+        already_selected: set | None = None,
         parent: QWidget | None = None,
     ) -> None:
-        """:param tabs: ``(tab_index, label)`` pairs."""
+        """:param tabs: ``(key, label)`` pairs.
+
+        ``key`` is any hashable identifier (typically the
+        :class:`TabContent` widget itself) that the caller will use to
+        look the selection back up.
+        """
         super().__init__(parent)
         self.setWindowTitle("Cluster Send — select sessions")
         already = already_selected or set()
@@ -76,11 +85,11 @@ class ClusterSelectDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Select sessions to include in the cluster:"))
 
-        self._checkboxes: list[tuple[int, QCheckBox]] = []
-        for idx, label in tabs:
+        self._checkboxes: list[tuple[Hashable, QCheckBox]] = []
+        for key, label in tabs:
             cb = QCheckBox(label, self)
-            cb.setChecked(idx in already)
-            self._checkboxes.append((idx, cb))
+            cb.setChecked(key in already)
+            self._checkboxes.append((key, cb))
             layout.addWidget(cb)
 
         buttons = QDialogButtonBox(
@@ -91,6 +100,6 @@ class ClusterSelectDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def selected(self) -> set[int]:
-        """Return the set of tab indices the user kept checked."""
-        return {i for i, cb in self._checkboxes if cb.isChecked()}
+    def selected(self) -> set:
+        """Return the set of keys whose checkboxes the user kept checked."""
+        return {key for key, cb in self._checkboxes if cb.isChecked()}

@@ -55,6 +55,20 @@ def test_bastion_profile_crud(store: SessionStore) -> None:
     assert [b.name for b in store.list_bastions()] == ["edge"]
 
 
+def test_folder_self_ref_relationship(store: SessionStore) -> None:
+    """``Folder.children`` must navigate to children, not parents."""
+    from core.session_store import Folder
+
+    parent_id = store.create_folder("parent")
+    child_id = store.create_folder("child", parent_id=parent_id)
+    with store.session() as s:
+        p = s.get(Folder, parent_id)
+        c = s.get(Folder, child_id)
+        assert [f.id for f in p.children] == [child_id]
+        assert c.parent is not None
+        assert c.parent.id == parent_id
+
+
 def test_master_auth_replace(store: SessionStore) -> None:
     store.set_master_auth(bcrypt_hash=b"$2b$abc", kdf_salt=b"saltA")
     store.set_master_auth(bcrypt_hash=b"$2b$xyz", kdf_salt=b"saltB")

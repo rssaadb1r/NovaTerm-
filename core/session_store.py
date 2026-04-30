@@ -64,12 +64,13 @@ class Folder(Base):
     )
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    children: Mapped[list[Folder]] = relationship(
+    # Self-referential tree: define the many-to-one ``parent`` side with
+    # ``remote_side=[id]`` so SQLAlchemy auto-generates the inverse
+    # one-to-many ``children`` collection correctly.
+    parent: Mapped[Folder | None] = relationship(
         "Folder",
-        backref="parent",
-        remote_side="Folder.id",
-        cascade="all",
-        single_parent=True,
+        remote_side=lambda: [Folder.id],
+        backref="children",
     )
 
 
