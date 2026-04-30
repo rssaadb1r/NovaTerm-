@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from dataclasses import dataclass
 
@@ -21,6 +22,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from .session_store import SessionStore
+
+logger = logging.getLogger(__name__)
 
 PBKDF2_ITERATIONS = 390_000
 SALT_BYTES = 16
@@ -117,6 +120,62 @@ class CredentialVault:
     def lock(self) -> None:
         """Drop the in-memory Fernet key. Subsequent encrypt/decrypt fail."""
         self._fernet = None
+
+    # -- migrations ----------------------------------------------------------
+
+    def migrate_default_session_plaintext(self) -> int:
+        """Encrypt any plaintext credential left on the Default Session row.
+
+        The :class:`DefaultSession` columns are typed as ``LargeBinary`` so
+        every well-formed write goes through :meth:`encrypt`. This method
+        defends against a stale row (e.g. a hand-edited DB or a regression
+        in older builds) that managed to land a non-ciphertext blob in
+        ``encrypted_password`` / ``encrypted_key_passphrase``: anything
+        that does not parse as a Fernet token is treated as plaintext,
+        re-encrypted with the current key, and written back.
+
+        Returns the number of columns that were re-encrypted. A warning is
+        emitted *without* the plaintext (or even its length) so the audit
+        trail is preserved without leaking the secret.
+        """
+        if self._fernet is None:
+            raise VaultLocked("Vault must be unlocked before migrating")
+
+        from .session_store import DefaultSession
+
+        fixed = 0
+        with self._store.session() as s:
+            row = s.get(DefaultSession, 1)
+            if row is None:
+                return 0
+            for column in ("encrypted_password", "encrypted_key_passphrase"):
+                blob = getattr(row, column)
+                if not blob:
+                    continue
+                try:
+                    self._fernet.decrypt(blob)
+                    continue  # already a valid Fernet token
+                except InvalidToken:
+                    pass
+                # Treat the blob as plaintext (UTF-8 if possible, else the
+                # raw bytes) and re-encrypt. The plaintext itself is
+                # *never* logged — just the column name.
+                try:
+                    plaintext = (
+                        blob.decode("utf-8")
+                        if isinstance(blob, (bytes, bytearray))
+                        else str(blob)
+                    )
+                except UnicodeDecodeError:
+                    plaintext = bytes(blob).hex()
+                setattr(row, column, self._fernet.encrypt(plaintext.encode("utf-8")))
+                fixed += 1
+                logger.warning(
+                    "Plaintext Default Session credential found in column "
+                    "%r — encrypted in place. (plaintext value not logged)",
+                    column,
+                )
+        return fixed
 
     def change_password(self, old_password: str, new_password: str) -> None:
         """Re-key the vault with a new master password.

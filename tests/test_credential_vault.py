@@ -185,6 +185,95 @@ def test_change_password_rejects_wrong_current(vault: CredentialVault) -> None:
     assert vault.decrypt(token) == "data"
 
 
+def test_default_session_password_is_encrypted_in_db(
+    vault: CredentialVault, store: SessionStore
+) -> None:
+    """The Default Session password column must hold ciphertext, never plaintext."""
+    vault.initialize("master")
+    plaintext = "the-default-pw"
+    store.update_default_session(
+        encrypted_password=vault.encrypt(plaintext),
+        encrypted_key_passphrase=vault.encrypt("the-default-passphrase"),
+    )
+    row = store.get_default_session()
+    assert row.encrypted_password is not None
+    assert plaintext.encode("utf-8") not in row.encrypted_password
+    assert row.encrypted_password != plaintext.encode("utf-8")
+    # And decrypting with the right key returns the original plaintext.
+    assert vault.decrypt(row.encrypted_password) == plaintext
+
+
+def test_default_session_decrypt_with_wrong_key_raises(
+    vault: CredentialVault, store: SessionStore
+) -> None:
+    """Decrypting Default Session ciphertext with a wrong Fernet key fails."""
+    from cryptography.fernet import Fernet
+
+    vault.initialize("master")
+    store.update_default_session(
+        encrypted_password=vault.encrypt("secret"),
+    )
+    blob = store.get_default_session().encrypted_password
+
+    wrong_vault = CredentialVault(store)
+    wrong_vault._fernet = Fernet(Fernet.generate_key())
+    with pytest.raises(VaultAuthError):
+        wrong_vault.decrypt(blob)
+
+
+def test_default_session_credentials_after_password_change(
+    vault: CredentialVault, store: SessionStore
+) -> None:
+    """After a master-password rotation the Default Session credential must
+    decrypt with the new key, and the *old* key must no longer work.
+    """
+    from cryptography.fernet import Fernet
+
+    vault.initialize("first")
+    pre_rotation_key = vault._fernet  # capture the old Fernet
+    plaintext = "default-pw"
+    store.update_default_session(encrypted_password=vault.encrypt(plaintext))
+
+    vault.change_password("first", "second")
+
+    refreshed = store.get_default_session()
+    # New Fernet decrypts.
+    assert vault.decrypt(refreshed.encrypted_password) == plaintext
+    # Old Fernet does NOT decrypt the freshly-rotated ciphertext.
+    assert pre_rotation_key is not None
+    from cryptography.fernet import InvalidToken
+    with pytest.raises(InvalidToken):
+        pre_rotation_key.decrypt(refreshed.encrypted_password)
+
+
+def test_migrate_default_session_plaintext_encrypts_in_place(
+    vault: CredentialVault, store: SessionStore
+) -> None:
+    """The startup migration must encrypt any plaintext blob it finds.
+
+    We bypass the encrypted-only public API by writing raw plaintext bytes
+    straight to the column, then assert the migration:
+
+    * detects the column is not a Fernet token,
+    * encrypts the plaintext and writes the ciphertext back,
+    * leaves a column that decrypts to the original plaintext.
+    """
+    vault.initialize("master")
+    # Hand-write a raw plaintext blob (simulates an older build / a hand
+    # edited DB that bypassed the dialog encryption path).
+    store.update_default_session(encrypted_password=b"plain-text-secret")
+
+    fixed = vault.migrate_default_session_plaintext()
+    assert fixed == 1
+
+    row = store.get_default_session()
+    assert row.encrypted_password != b"plain-text-secret"
+    assert vault.decrypt(row.encrypted_password) == "plain-text-secret"
+
+    # Idempotent: a second pass must be a no-op.
+    assert vault.migrate_default_session_plaintext() == 0
+
+
 def test_export_import_bundle(vault: CredentialVault) -> None:
     vault.initialize("x")
     bundle = vault.export_bundle({"a": "1", "b": "2"}, passphrase="abc")

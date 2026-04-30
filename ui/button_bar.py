@@ -17,8 +17,8 @@ Visibility is toggled from ``View → Button Bar`` in the main menu.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QResizeEvent
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QResizeEvent, QShowEvent
 from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -96,6 +96,14 @@ class ButtonBar(QFrame):
         )
         outer.addWidget(self._button_host, 1)
 
+        # Shown when the database has no commands at all so the user has
+        # somewhere to right-click for the *Manage Button Bar* menu.
+        self._empty_label = QLabel(
+            "No commands — right-click to manage", self._button_host
+        )
+        self._empty_label.setStyleSheet("color: palette(mid);")
+        self._empty_label.hide()
+
         # Overflow menu trigger.
         self._overflow_menu = QMenu(self)
         self._overflow_button = QToolButton(self)
@@ -141,6 +149,18 @@ class ButtonBar(QFrame):
         super().resizeEvent(event)
         self._relayout()
 
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 (Qt API)
+        """Re-flow on show so toggling visibility doesn't strand buttons.
+
+        When the bar is constructed hidden (its default state — the user
+        opts in via *View → Button Bar*), the inner ``_button_host`` has
+        zero width until the parent layout resolves. We schedule a
+        :meth:`_relayout` for the next event loop iteration so the
+        geometry is up-to-date by the time it runs.
+        """
+        super().showEvent(event)
+        QTimer.singleShot(0, self._relayout)
+
     # -- internals ---------------------------------------------------------
 
     def _current_group_id(self) -> int | None:
@@ -184,6 +204,19 @@ class ButtonBar(QFrame):
         available = host.width()
         if available <= 0:
             return
+
+        # Empty state — nothing to lay out, just show the placeholder.
+        if not self._buttons:
+            self._empty_label.setGeometry(
+                4, (MAX_HEIGHT - self._empty_label.sizeHint().height()) // 2,
+                max(0, available - 8),
+                self._empty_label.sizeHint().height(),
+            )
+            self._empty_label.show()
+            self._overflow_button.hide()
+            self._overflow_menu.clear()
+            return
+        self._empty_label.hide()
 
         x = 0
         y = (MAX_HEIGHT - 8 - 4) // 2  # vertically centre within host

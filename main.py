@@ -64,6 +64,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not _prompt_master_password(vault, app):
         return 0
 
+    # Defensive migration: anything left as plaintext in the Default
+    # Session credential columns is encrypted on every launch. The
+    # vault.migrate_* helper logs a single warning per fixed column and
+    # never echoes the plaintext (see CLAUDE.md §6).
+    vault.migrate_default_session_plaintext()
+
     window = MainWindow(store, vault, commands)
     window.show()
 
