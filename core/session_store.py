@@ -157,6 +157,7 @@ class Command(Base):
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     hotkey: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class RecentConnection(Base):
@@ -305,6 +306,18 @@ class SessionStore:
                 conn.exec_driver_sql(
                     "ALTER TABLE folders ADD COLUMN is_expanded BOOLEAN "
                     "NOT NULL DEFAULT 1"
+                )
+
+            cmd_cols = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(commands)"
+                ).fetchall()
+            }
+            if "sort_order" not in cmd_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE commands ADD COLUMN sort_order INTEGER "
+                    "NOT NULL DEFAULT 0"
                 )
             # ``default_session`` ships as a brand-new table, so
             # ``create_all`` already handled it; nothing else to migrate yet.

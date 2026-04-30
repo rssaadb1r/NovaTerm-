@@ -75,6 +75,15 @@ class CommandStore:
                 s.scalars(select(CommandGroup).order_by(CommandGroup.sort_order, CommandGroup.name))
             )
 
+    def update_group(self, group_id: int, **fields: Any) -> None:
+        """Update fields on an existing :class:`CommandGroup` row."""
+        with self._store.session() as s:
+            row = s.get(CommandGroup, group_id)
+            if row is None:
+                raise KeyError(f"CommandGroup id={group_id} not found")
+            for k, v in fields.items():
+                setattr(row, k, v)
+
     def delete_group(self, group_id: int) -> None:
         """Delete a command group (commands inside become group-less)."""
         with self._store.session() as s:
@@ -109,12 +118,51 @@ class CommandStore:
                 s.delete(row)
 
     def list_commands(self, group_id: int | None = None) -> list[Command]:
-        """Return all commands (optionally filtered by group)."""
+        """Return all commands ordered by ``(sort_order, name)``.
+
+        :param group_id: If given, restrict the result to commands inside
+            that :class:`CommandGroup`.
+        """
         with self._store.session() as s:
-            stmt = select(Command).order_by(Command.name)
+            stmt = select(Command).order_by(Command.sort_order, Command.name)
             if group_id is not None:
                 stmt = stmt.where(Command.group_id == group_id)
             return list(s.scalars(stmt))
+
+    def reorder_command(self, command_id: int, *, delta: int) -> None:
+        """Swap a command with its neighbour (``delta`` is ``-1`` or ``+1``).
+
+        Reordering happens within the command's own group; commands in
+        other groups are left alone. If the command is already at the top
+        (or bottom) of its group nothing happens.
+        """
+        if delta not in (-1, 1):
+            raise ValueError("delta must be -1 or +1")
+        with self._store.session() as s:
+            cmd = s.get(Command, command_id)
+            if cmd is None:
+                return
+            siblings = list(
+                s.scalars(
+                    select(Command)
+                    .where(Command.group_id == cmd.group_id)
+                    .order_by(Command.sort_order, Command.name, Command.id)
+                )
+            )
+            try:
+                pos = siblings.index(cmd)
+            except ValueError:
+                return
+            new_pos = pos + delta
+            if new_pos < 0 or new_pos >= len(siblings):
+                return
+            # Re-pack ``sort_order`` so the result is stable even if the
+            # rows previously shared the same value (e.g. all zero from
+            # the legacy schema).
+            reordered = list(siblings)
+            reordered[pos], reordered[new_pos] = reordered[new_pos], reordered[pos]
+            for idx, row in enumerate(reordered):
+                row.sort_order = idx
 
     def search_commands(self, query: str) -> list[Command]:
         """Naive fuzzy search: match contiguous letters of ``query`` in name/text."""

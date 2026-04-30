@@ -27,8 +27,11 @@ from core.credential_vault import CredentialVault, VaultAuthError
 from core.session_store import SessionStore
 from core.ssh_client import AsyncSSHClient, HopConfig, SSHConnectConfig
 
+from .button_bar import ButtonBar
 from .cluster_bar import ClusterInputBar, ClusterSelectDialog
-from .command_manager import CommandFuzzyPopup, CommandManagerPanel
+from .command_manager import CommandFuzzyPopup
+from .command_manager_editor import CommandManagerEditor
+from .command_window import DEFAULT_HEIGHT as _CMD_WINDOW_DEFAULT_HEIGHT, CommandWindow
 from .default_session_dialog import DefaultSessionDialog
 from .quick_connect import QuickConnectDialog
 from .session_dialog import SessionDialog
@@ -92,6 +95,11 @@ class MainWindow(QMainWindow):
         )
         self._splitter.addWidget(self._sidebar)
 
+        # The right-hand pane is a vertical splitter containing two
+        # children: a top stack (tabs + Button Bar) and the Command
+        # Window. The vertical splitter is what gives the Command Window
+        # its 'drag the top edge to resize' behaviour required by the
+        # spec.
         self._tabs = NovaTabWidget(self)
         self._tabs.close_requested.connect(self._close_tab)
         self._tabs.disconnect_requested.connect(self._disconnect_tab)
@@ -105,9 +113,38 @@ class MainWindow(QMainWindow):
         self._tabs.split_vertical_requested.connect(
             lambda i: self._split_tab(i, Qt.Orientation.Vertical)
         )
-        self._splitter.addWidget(self._tabs)
-        self._splitter.setSizes([250, 1030])
 
+        self._button_bar = ButtonBar(commands, self)
+        self._button_bar.command_clicked.connect(self._on_button_bar_clicked)
+        self._button_bar.manage_requested.connect(self._on_open_command_manager)
+        self._button_bar.hide()  # toggled on via View menu
+
+        top_pane = QWidget(self)
+        top_layout = QVBoxLayout(top_pane)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(0)
+        top_layout.addWidget(self._tabs, 1)
+        top_layout.addWidget(self._button_bar, 0)
+
+        self._command_window = CommandWindow(self)
+        self._command_window.send_to_active.connect(
+            self._on_command_window_send_active
+        )
+        self._command_window.send_to_all.connect(
+            self._on_command_window_send_all
+        )
+        self._command_window.hide()  # toggled on via View menu / Ctrl+Shift+C
+
+        self._right_splitter = QSplitter(Qt.Orientation.Vertical, central)
+        self._right_splitter.addWidget(top_pane)
+        self._right_splitter.addWidget(self._command_window)
+        self._right_splitter.setStretchFactor(0, 1)
+        self._right_splitter.setStretchFactor(1, 0)
+        self._right_splitter.setCollapsible(1, False)
+        self._right_splitter.setSizes([800, _CMD_WINDOW_DEFAULT_HEIGHT])
+
+        self._splitter.addWidget(self._right_splitter)
+        self._splitter.setSizes([250, 1030])
         outer.addWidget(self._splitter, 1)
 
         # Cluster bar (initially hidden).
@@ -118,14 +155,6 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._cluster_bar)
 
         self.setCentralWidget(central)
-
-        # -- command manager dock ----------------------------------------
-        self._commands_panel = CommandManagerPanel(commands, self)
-        self._commands_panel.send_to_active.connect(self._send_command_to_active)
-        self._commands_panel.send_to_all.connect(self._send_command_to_all)
-        dock = QDockWidget("Commands", self)
-        dock.setWidget(self._commands_panel)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
 
         self._build_menus()
         self._build_toolbar()
@@ -156,11 +185,28 @@ class MainWindow(QMainWindow):
         opt_menu.addAction(
             self._make_action("Default Session…", self._on_edit_default_session)
         )
+        opt_menu.addAction(
+            self._make_action("Command Manager…", self._on_open_command_manager)
+        )
 
         view_menu = mb.addMenu("&View")
         view_menu.addAction(
             self._make_action("Toggle Session Manager", self._toggle_sidebar)
         )
+        # Independent toggles — Button Bar and Command Window can be on or
+        # off in any combination per the Feature spec.
+        self._toggle_button_bar_action = QAction("Button Bar", self)
+        self._toggle_button_bar_action.setCheckable(True)
+        self._toggle_button_bar_action.toggled.connect(self._toggle_button_bar)
+        view_menu.addAction(self._toggle_button_bar_action)
+
+        self._toggle_command_window_action = QAction("Command Window", self)
+        self._toggle_command_window_action.setCheckable(True)
+        self._toggle_command_window_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        self._toggle_command_window_action.toggled.connect(self._toggle_command_window)
+        view_menu.addAction(self._toggle_command_window_action)
+
+        view_menu.addSeparator()
         view_menu.addAction(self._make_action("Toggle Cluster Mode…", self._on_open_cluster))
 
         help_menu = mb.addMenu("&Help")
@@ -863,6 +909,48 @@ class MainWindow(QMainWindow):
     def _toggle_sidebar(self) -> None:
         """Show / hide the session manager sidebar."""
         self._sidebar.setVisible(not self._sidebar.isVisible())
+
+    # ------------------------------------------------------------------
+    # Button Bar / Command Window
+    # ------------------------------------------------------------------
+
+    def _toggle_button_bar(self, checked: bool) -> None:
+        """Show / hide the bottom Button Bar (View menu toggle)."""
+        self._button_bar.setVisible(checked)
+
+    def _toggle_command_window(self, checked: bool) -> None:
+        """Show / hide the Command Window (View menu toggle / Ctrl+Shift+C)."""
+        self._command_window.setVisible(checked)
+        if checked:
+            # Restore the default 80px height if the user previously
+            # collapsed the splitter past it.
+            sizes = self._right_splitter.sizes()
+            if len(sizes) == 2 and sizes[1] < _CMD_WINDOW_DEFAULT_HEIGHT:
+                top = max(0, sum(sizes) - _CMD_WINDOW_DEFAULT_HEIGHT)
+                self._right_splitter.setSizes([top, _CMD_WINDOW_DEFAULT_HEIGHT])
+            self._command_window.focus_editor()
+
+    def _on_button_bar_clicked(self, text: str) -> None:
+        """Send a Button-Bar command to the active session.
+
+        The bar's whole purpose is one-click execution, so we append a
+        trailing newline to actually run the command on the remote shell.
+        """
+        self._send_command_to_active(text, True)
+
+    def _on_command_window_send_active(self, text: str) -> None:
+        """Forward the Command Window text to the active session."""
+        self._send_command_to_active(text, False)
+
+    def _on_command_window_send_all(self, text: str) -> None:
+        """Forward the Command Window text to every connected session."""
+        self._send_command_to_all(text, False)
+
+    def _on_open_command_manager(self) -> None:
+        """Open the Command Manager editor and refresh the bar on save."""
+        dlg = CommandManagerEditor(self._commands, self)
+        if dlg.exec() == dlg.DialogCode.Accepted:
+            self._button_bar.refresh()
 
     def _on_about(self) -> None:
         """Show the about dialog."""
