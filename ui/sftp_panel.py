@@ -175,6 +175,17 @@ class TransferQueuePanel(QWidget):
             label = f"#{tid} {prog.direction:8s} {status:>10s}  {speed_kb:7.1f} KB/s  {prog.src} → {prog.dst}"
             self._list.addItem(label)
 
+    def stop_refresh(self) -> None:
+        """Stop the background refresh timer.
+
+        Called from :class:`SFTPPanel` cleanup so a closed panel no longer
+        wakes up every 500ms forever (which would otherwise leak whenever
+        the user opens / closes the SFTP dock repeatedly during a
+        session).
+        """
+        if self._timer.isActive():
+            self._timer.stop()
+
 
 class SFTPPanel(QWidget):
     """Composed SFTP file manager — local pane + remote pane + transfers."""
@@ -198,3 +209,24 @@ class SFTPPanel(QWidget):
 
         self.transfers = TransferQueuePanel(queue, self)
         layout.addWidget(self.transfers, 1)
+
+    def cleanup(self) -> None:
+        """Stop the refresh timer and shut down the transfer thread pool.
+
+        :class:`MainWindow._on_open_sftp` wires this to the parent
+        :class:`QDockWidget` ``destroyed`` signal so closing the dock
+        actually releases the 3-thread :class:`ThreadPoolExecutor` and
+        the perpetual 500ms refresh ``QTimer``. Without this, repeated
+        SFTP opens during a session would accumulate orphaned threads
+        and timers indefinitely.
+        """
+        self.transfers.stop_refresh()
+        try:
+            self._queue.shutdown()
+        except Exception:  # pragma: no cover — best-effort cleanup
+            pass
+
+    def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        """Run cleanup before the widget is destroyed."""
+        self.cleanup()
+        super().closeEvent(event)

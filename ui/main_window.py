@@ -908,7 +908,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_open_sftp(self) -> None:
-        """Open an SFTP panel for the current SSH connection."""
+        """Open an SFTP panel for the current SSH connection.
+
+        The dock is set to ``WA_DeleteOnClose`` and the panel's
+        ``cleanup()`` runs on ``destroyed`` so closing the dock actually
+        releases the 3-thread :class:`ThreadPoolExecutor` and the 500ms
+        refresh ``QTimer`` (otherwise reopening SFTP repeatedly during a
+        session would accumulate orphaned threads / timers forever).
+        Only one SFTP dock is kept alive at a time — opening a second
+        one closes the previous panel first.
+        """
         content = self._content_at(self._tabs.currentIndex())
         client = self._ssh_clients.get(content) if content is not None else None
         if client is None or not client.connected:
@@ -918,6 +927,13 @@ class MainWindow(QMainWindow):
 
         from .sftp_panel import SFTPPanel
 
+        # Drop any previous SFTP dock so we never run two thread pools
+        # at once.
+        previous = getattr(self, "_sftp_dock", None)
+        if previous is not None:
+            previous.close()
+            self._sftp_dock = None
+
         sftp = SFTPClient(client)
         queue = SFTPTransferQueue(
             sftp,
@@ -925,7 +941,13 @@ class MainWindow(QMainWindow):
         )
         panel = SFTPPanel(sftp, queue)
         dock = QDockWidget("SFTP", self)
+        dock.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dock.setWidget(panel)
+        # Belt-and-braces: when the dock is destroyed, run panel.cleanup()
+        # in case ``WA_DeleteOnClose`` skips ``QWidget.closeEvent`` on the
+        # child (some Qt platforms route close through hide()).
+        dock.destroyed.connect(lambda _o=None, p=panel: p.cleanup())
+        self._sftp_dock = dock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     # ------------------------------------------------------------------

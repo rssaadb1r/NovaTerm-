@@ -94,6 +94,15 @@ class AsyncSSHClient:
             await loop.run_in_executor(None, self._connect_sync, wrapped)
         except Exception as exc:
             logger.exception("SSH connection failed")
+            # Tear down any jump-host transports / target client that
+            # _connect_sync had managed to bring up before the failure;
+            # otherwise their TCP sockets leak until the GC runs (and
+            # _disconnect_sync would never be called for a connection
+            # that never reached _connected=True).
+            try:
+                await loop.run_in_executor(None, self._disconnect_sync)
+            except Exception:
+                logger.exception("Cleanup after failed SSH connect raised")
             raise SSHConnectionError(str(exc)) from exc
         self._connected = True
 
