@@ -1,18 +1,22 @@
 """Terminal display widget + inline find/highlight bar (Feature 9).
 
-NovaTerm's terminal display is a ``QPlainTextEdit`` with an inline
-ANSI-stripping layer applied to remote output. The original spec called
-for the C++ ``QTermWidget``, but no usable PyQt6 binding for that
-library is available on PyPI for Linux Fedora 44 (see CLAUDE.md
-sections 1 and 10 for the design note). Until a native backend can be
-slotted in we strip CSI / OSC / single-character escape sequences from
-the byte stream so raw SSH output renders as readable text instead of
-garbled escape codes; full ANSI emulation (colour, cursor positioning,
-etc.) is a known follow-up.
+NovaTerm's terminal display is a ``QPlainTextEdit`` driven by a
+:mod:`pyte` :class:`~pyte.HistoryScreen` emulator (CLAUDE.md §1, §10).
+Remote output is fed through :class:`pyte.Stream`, which interprets
+CSI / OSC / SGR / cursor-positioning escape sequences against a fixed
+character grid; the grid is then re-rendered into the QPlainTextEdit
+with :class:`QTextCharFormat` runs carrying ANSI fore/back colours,
+bold, italic, underline and reverse-video attributes. Lines that scroll
+off the top of the screen accumulate in :attr:`HistoryScreen.history`
+and are prefixed to every redraw so the user keeps a configurable
+scrollback buffer.
 
-The public API exposed by :class:`TerminalWidget` is unchanged from the
-spec so a future native backend can be slotted in without touching
-callers.
+The original spec called for the C++ ``QTermWidget`` binding, but no
+usable PyQt6 wheel is published for Linux Fedora 44. ``QPlainTextEdit``
+is used as the rendering surface so the public API exposed by
+:class:`TerminalWidget` (``append_output``, ``apply_theme``,
+``set_scrollback``, ``set_font``) stays stable in the event we ever
+slot in a native backend.
 """
 from __future__ import annotations
 
@@ -21,11 +25,14 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from PyQt6.QtCore import Qt, pyqtSignal
+import pyte
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QFontMetricsF,
     QKeyEvent,
     QTextCharFormat,
     QTextCursor,
@@ -47,23 +54,93 @@ from PyQt6.QtWidgets import (
 
 logger = logging.getLogger(__name__)
 
-# Match any ANSI escape sequence we know how to throw away:
-#   * CSI sequences:   ESC [ <params> <final-byte 0x40-0x7E>
-#   * OSC sequences:   ESC ]  ... BEL  or  ESC ] ... ESC \
-#   * Single-char esc: ESC <char in 0x40..0x5F>
-# Plus the DEL byte (0x7F) and the bare BEL (0x07) which some shells
-# emit on tab-completion failures.
-_ANSI_RE = re.compile(
-    r"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC
-    r"|\x1b[@-_]"  # 2-byte ESC + final
-    r"|[\x07\x7f]"
-)
+# ---------------------------------------------------------------------------
+# Pyte palette
+# ---------------------------------------------------------------------------
+#
+# pyte stores cell foreground / background as a string — either the name of
+# one of the 16 ANSI colours ("red", "brightblue", "default", …) or a 6-digit
+# hex code ("ff8800") for 256-colour / truecolour SGRs. The map below is the
+# VS Code dark palette — close enough to the SecureCRT defaults that the
+# common shell prompts read correctly.
+_PYTE_PALETTE: dict[str, str] = {
+    "black":         "#000000",
+    "red":           "#cd3131",
+    "green":         "#0dbc79",
+    "brown":         "#e5e510",   # pyte calls yellow "brown"
+    "blue":          "#2472c8",
+    "magenta":       "#bc3fbc",
+    "cyan":          "#11a8cd",
+    "white":         "#e5e5e5",
+    "brightblack":   "#666666",
+    "brightred":     "#f14c4c",
+    "brightgreen":   "#23d18b",
+    "brightbrown":   "#f5f543",
+    "brightblue":    "#3b8eea",
+    "brightmagenta": "#d670d6",
+    "brightcyan":    "#29b8db",
+    "brightwhite":   "#ffffff",
+}
 
 
-def _strip_ansi(text: str) -> str:
-    """Return ``text`` with ANSI escape sequences removed."""
-    return _ANSI_RE.sub("", text)
+def _pyte_qcolor(name: str | None, fallback: QColor) -> QColor:
+    """Translate a pyte colour token into a :class:`QColor`.
+
+    pyte uses the literal string ``"default"`` for SGR 0 (reset to the
+    user's chosen foreground / background); we map that back to the
+    theme defaults. Anything else is either a palette name or a 6-digit
+    hex code emitted by the 256-colour / truecolour SGR handler.
+    """
+    if not name or name == "default":
+        return fallback
+    if name in _PYTE_PALETTE:
+        return QColor(_PYTE_PALETTE[name])
+    if len(name) == 6 and all(c in "0123456789abcdef" for c in name):
+        return QColor("#" + name)
+    return fallback
+
+
+class _PyteEmulator:
+    """Thin :class:`pyte.HistoryScreen` + :class:`pyte.Stream` wrapper.
+
+    SSH and Telnet servers stream raw VT-style byte sequences; pyte
+    interprets them against a fixed-size character grid and exposes the
+    resulting cells via :attr:`pyte.Screen.buffer`. ``LNM`` mode is set
+    so a bare ``\\n`` is treated as ``\\r\\n`` — some servers (and our
+    own injected log-banner output) emit only line-feeds, and without
+    LNM the cursor would walk diagonally instead of returning to col 0.
+    """
+
+    def __init__(self, cols: int, rows: int, history: int) -> None:
+        """Allocate a screen of ``cols x rows`` plus ``history`` scrollback."""
+        self.screen = pyte.HistoryScreen(
+            cols, rows, history=history, ratio=0.5
+        )
+        self.screen.set_mode(pyte.modes.LNM)
+        self.stream = pyte.Stream(self.screen)
+
+    def feed(self, text: str) -> None:
+        """Process a chunk of remote output through the emulator."""
+        try:
+            self.stream.feed(text)
+        except Exception:  # pragma: no cover — defensive, pyte rarely raises
+            logger.exception("pyte stream rejected output chunk")
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Resize the underlying grid (rows / cols swap, per pyte API)."""
+        if cols <= 0 or rows <= 0:
+            return
+        if cols == self.screen.columns and rows == self.screen.lines:
+            return
+        try:
+            self.screen.resize(rows, cols)
+        except Exception:  # pragma: no cover
+            logger.exception("pyte resize failed (%dx%d)", cols, rows)
+
+    def reset(self) -> None:
+        """Clear screen + scrollback."""
+        self.screen.reset()
+        self.screen.set_mode(pyte.modes.LNM)
 
 # ---------------------------------------------------------------------------
 # Find bar
@@ -242,12 +319,6 @@ class TerminalWidget(QWidget):
         self._display.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._display.customContextMenuRequested.connect(self._show_context_menu)
         self._display.installEventFilter(self)
-        # Auto-copy: any selection change pushes the selected text to
-        # the clipboard immediately, so the user never has to press
-        # Ctrl+C or right-click to copy. selectionChanged fires once
-        # when the mouse drag completes (and on every keyboard-driven
-        # selection extension), which is exactly when the spec wants
-        # the clipboard updated.
         self._display.selectionChanged.connect(self._auto_copy_selection)
         layout.addWidget(self._display, 1)
 
@@ -258,9 +329,24 @@ class TerminalWidget(QWidget):
         self._find_bar.prev_match.connect(lambda: self._advance_match(-1))
         self._find_bar.closed.connect(self.close_find_bar)
 
-        # Hooks injected by the controller.
         self._broadcast_callback: Callable[[str], None] | None = None
         self._on_clear_scrollback: Callable[[], None] | None = None
+
+        # Theme colours — stashed so the pyte renderer can resolve
+        # ``default`` cells back to the active theme's fg / bg pair.
+        self._theme_fg = QColor("#d4d4d4")
+        self._theme_bg = QColor("#1e1e1e")
+
+        # Pyte emulator + debounced redraw timer. Coalescing redraws to
+        # ~60Hz keeps high-volume output (``yes``, ``cat /var/log``)
+        # from rebuilding the QTextDocument on every byte.
+        self._emulator = _PyteEmulator(
+            cols=80, rows=24, history=self._display.maximumBlockCount()
+        )
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.setInterval(16)
+        self._redraw_timer.timeout.connect(self._redraw_from_emulator)
 
         self.apply_theme(
             background="#1e1e1e",
@@ -268,38 +354,45 @@ class TerminalWidget(QWidget):
             cursor="#ffffff",
             selection="#264f78",
         )
+        self._sync_emulator_size()
 
     # -- public API --------------------------------------------------------
 
     def append_output(self, text: str) -> None:
-        """Append output received from the remote side.
+        """Feed remote output to the pyte emulator.
 
-        Raw SSH output frequently contains ANSI escape sequences (e.g.
-        ``\x1b[31m`` colour codes, ``\x1b]0;title\x07`` OSC titles,
-        cursor moves, etc.). The current backend has no terminal
-        emulator wired up, so we strip those sequences here — otherwise
-        they show up as visible gibberish in the QPlainTextEdit.
+        The actual repaint of the :class:`QPlainTextEdit` happens via
+        :meth:`_redraw_from_emulator`, debounced through a 16ms timer
+        so a high-rate stream (e.g. ``yes`` / ``tail -f``) doesn't
+        rebuild the QTextDocument on every chunk.
         """
-        clean = _strip_ansi(text)
-        if not clean:
+        if not text:
             return
-        cursor = self._display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(clean)
-        self._display.setTextCursor(cursor)
-        self._display.ensureCursorVisible()
-        if self._matches:
-            self._refresh_highlights()
+        self._emulator.feed(text)
+        if not self._redraw_timer.isActive():
+            self._redraw_timer.start()
 
     def set_scrollback(self, lines: int) -> None:
-        """Change the maximum number of retained lines."""
-        self._display.setMaximumBlockCount(max(100, lines))
+        """Change the maximum number of retained lines.
+
+        Sets both the QPlainTextEdit's block cap *and* the pyte history
+        budget so they stay in sync — otherwise pyte would either keep
+        more lines than the widget can render, or fewer than the user
+        configured in *Settings → Terminal*.
+        """
+        capped = max(100, lines)
+        self._display.setMaximumBlockCount(capped)
+        # pyte exposes the history limit as a writable namedtuple field;
+        # rebuild it preserving the existing top / bottom buffers.
+        h = self._emulator.screen.history
+        self._emulator.screen.history = h._replace(size=capped)
 
     def set_font(self, family: str, size: int) -> None:
         """Set the terminal font family and size."""
         font = QFont(family, size)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self._display.setFont(font)
+        self._sync_emulator_size()
 
     def apply_theme(
         self,
@@ -320,9 +413,13 @@ class TerminalWidget(QWidget):
             }}
             """
         )
-        # cursor is set indirectly via stylesheet limitations on QPlainTextEdit
-        # — kept here for API parity even when unused.
-        _ = cursor
+        # Stash defaults so the pyte renderer can resolve ``default``
+        # cells to the right colour.
+        self._theme_bg = QColor(background)
+        self._theme_fg = QColor(foreground)
+        _ = cursor  # QPlainTextEdit caret colour is platform-controlled.
+        if hasattr(self, "_emulator"):
+            self._redraw_from_emulator()
 
     def open_find_bar(self) -> None:
         """Show the find bar (Ctrl+F)."""
@@ -448,6 +545,7 @@ class TerminalWidget(QWidget):
         """Clear the scrollback buffer (overridable per-session)."""
         if self._on_clear_scrollback is not None:
             self._on_clear_scrollback()
+        self._emulator.reset()
         self._display.clear()
 
     # -- find / highlight --------------------------------------------------
@@ -523,6 +621,157 @@ class TerminalWidget(QWidget):
             return
         self._current_match = (self._current_match + delta) % len(self._matches)
         self._refresh_highlights()
+
+    # -- pyte rendering ----------------------------------------------------
+
+    def _sync_emulator_size(self) -> None:
+        """Match the pyte grid to the QPlainTextEdit's pixel viewport.
+
+        Run on construction, font change, and every resize event. Cols
+        and rows are derived from the monospace font's advance width
+        and line spacing; both are clamped so a tiny / zero-sized
+        widget never crashes pyte (which rejects ``cols=0``).
+        """
+        viewport = self._display.viewport()
+        if viewport is None:
+            return
+        metrics = QFontMetricsF(self._display.font())
+        advance = metrics.horizontalAdvance("M") or 8.0
+        line_h = metrics.lineSpacing() or 14.0
+        cols = max(20, int(viewport.width() / advance))
+        rows = max(5, int(viewport.height() / line_h))
+        self._emulator.resize(cols, rows)
+        if not self._redraw_timer.isActive():
+            self._redraw_timer.start()
+
+    def resizeEvent(self, event):  # noqa: N802 — Qt API
+        """Re-tile the pyte grid to match the new viewport size."""
+        super().resizeEvent(event)
+        self._sync_emulator_size()
+
+    def _redraw_from_emulator(self) -> None:
+        """Rebuild the :class:`QPlainTextEdit` from the pyte buffer.
+
+        Walks ``screen.history.top`` (lines that have scrolled off) and
+        then the current ``screen.buffer`` rows; each row is grouped
+        into runs of consecutive cells with identical attributes and
+        emitted as :class:`QTextCharFormat`-styled
+        :py:meth:`insertText` calls. The selection range and scrollbar
+        position are preserved so streaming output doesn't blow away
+        the user's text selection or scrollback position.
+        """
+        document = self._display.document()
+        old_cursor = self._display.textCursor()
+        sel_anchor = old_cursor.anchor() if old_cursor.hasSelection() else -1
+        sel_pos = old_cursor.position() if old_cursor.hasSelection() else -1
+        sb = self._display.verticalScrollBar()
+        scroll_value = sb.value()
+        at_bottom = scroll_value >= sb.maximum() - 2
+
+        cursor = QTextCursor(document)
+        cursor.beginEditBlock()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.removeSelectedText()
+
+        first_block = True
+        for line in self._iter_render_lines():
+            if not first_block:
+                cursor.insertBlock()
+            first_block = False
+            self._render_line(cursor, line)
+        cursor.endEditBlock()
+
+        doc_len = document.characterCount() - 1
+        if sel_anchor >= 0 and sel_pos >= 0 and doc_len > 0:
+            new_cursor = QTextCursor(document)
+            new_cursor.setPosition(min(sel_anchor, doc_len))
+            new_cursor.setPosition(
+                min(sel_pos, doc_len), QTextCursor.MoveMode.KeepAnchor
+            )
+            self._display.setTextCursor(new_cursor)
+
+        if at_bottom:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(min(scroll_value, sb.maximum()))
+
+        if self._matches:
+            # Match offsets shift around as the buffer redraws — re-run
+            # the search against the new document.
+            self._on_find_query(
+                self._find_bar.query.text(),
+                self._find_bar.case_cb.isChecked(),
+                self._find_bar.regex_cb.isChecked(),
+            )
+
+    def _iter_render_lines(self):
+        """Yield every visible row — history first, then current screen."""
+        screen = self._emulator.screen
+        for line in screen.history.top:
+            yield line
+        for y in range(screen.lines):
+            yield screen.buffer[y]
+
+    def _render_line(self, cursor: QTextCursor, line) -> None:
+        """Emit one screen row into ``cursor`` as styled runs.
+
+        Adjacent cells with identical (fg, bg, bold, italic, underscore,
+        reverse, strike) tuples are coalesced into a single
+        :py:meth:`insertText` call so the QTextDocument doesn't
+        fragment into thousands of tiny runs.
+        """
+        screen = self._emulator.screen
+        cols = screen.columns
+
+        # Trim trailing default-coloured spaces so each line looks like
+        # ``"prompt$ "`` instead of being padded out to N columns of
+        # blanks (which would make selection sweep highlight the empty
+        # tail and visually ruin the layout).
+        last = -1
+        for x in range(cols - 1, -1, -1):
+            cell = line[x]
+            if cell.data != " " or cell.fg != "default" or cell.bg != "default":
+                last = x
+                break
+        if last < 0:
+            return
+
+        run_chars: list[str] = []
+        run_key: tuple | None = None
+        for x in range(last + 1):
+            cell = line[x]
+            key = (
+                cell.fg, cell.bg, cell.bold, cell.italics,
+                cell.underscore, cell.reverse, cell.strikethrough,
+            )
+            if run_key is not None and key != run_key:
+                cursor.insertText("".join(run_chars), self._format_for_key(run_key))
+                run_chars = []
+            run_key = key
+            run_chars.append(cell.data)
+        if run_chars and run_key is not None:
+            cursor.insertText("".join(run_chars), self._format_for_key(run_key))
+
+    def _format_for_key(self, key: tuple) -> QTextCharFormat:
+        """Build a :class:`QTextCharFormat` from a packed cell key."""
+        fg_name, bg_name, bold, italics, underscore, reverse, strike = key
+        fg = _pyte_qcolor(fg_name, self._theme_fg)
+        bg = _pyte_qcolor(bg_name, self._theme_bg)
+        if reverse:
+            fg, bg = bg, fg
+        fmt = QTextCharFormat()
+        fmt.setForeground(fg)
+        if bg_name != "default" or reverse:
+            fmt.setBackground(bg)
+        if bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        if italics:
+            fmt.setFontItalic(True)
+        if underscore:
+            fmt.setFontUnderline(True)
+        if strike:
+            fmt.setFontStrikeOut(True)
+        return fmt
 
     # -- key forwarding ----------------------------------------------------
 
