@@ -17,7 +17,9 @@ Visibility is toggled from ``View → Button Bar`` in the main menu.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+import logging
+
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QResizeEvent, QShowEvent
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -32,6 +34,8 @@ from PyQt6.QtWidgets import (
 )
 
 from core.command_store import CommandStore
+
+logger = logging.getLogger(__name__)
 
 #: The bar is a thin single-row strip — no matter how many commands the
 #: user has, the height is locked here so it never grows into a panel.
@@ -117,6 +121,13 @@ class ButtonBar(QFrame):
         self._overflow_button.hide()
         outer.addWidget(self._overflow_button)
 
+        # An event filter on the button host catches the resize that
+        # happens *after* showEvent (the parent layout doesn't allocate
+        # the host's final width until the next event-loop iteration
+        # following the show, so the QTimer.singleShot from showEvent
+        # alone occasionally fired against a still-zero-width host).
+        self._button_host.installEventFilter(self)
+
         self._buttons: list[QPushButton] = []
         self.refresh()
 
@@ -139,6 +150,11 @@ class ButtonBar(QFrame):
                     self._group_combo.setCurrentIndex(idx)
                     break
         self._group_combo.blockSignals(False)
+        logger.debug(
+            "ButtonBar.refresh: %d groups, current=%r",
+            len(groups),
+            self._group_combo.currentText(),
+        )
 
         self._populate_buttons()
 
@@ -156,10 +172,18 @@ class ButtonBar(QFrame):
         opts in via *View → Button Bar*), the inner ``_button_host`` has
         zero width until the parent layout resolves. We schedule a
         :meth:`_relayout` for the next event loop iteration so the
-        geometry is up-to-date by the time it runs.
+        geometry is up-to-date by the time it runs. The eventFilter on
+        ``_button_host`` is the fallback for compositors that resize the
+        child widget *after* this QTimer fires.
         """
         super().showEvent(event)
         QTimer.singleShot(0, self._relayout)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802 (Qt API)
+        """Re-run the manual layout whenever the button host is resized."""
+        if obj is self._button_host and event.type() == QEvent.Type.Resize:
+            self._relayout()
+        return super().eventFilter(obj, event)
 
     # -- internals ---------------------------------------------------------
 
@@ -179,6 +203,11 @@ class ButtonBar(QFrame):
 
         gid = self._current_group_id()
         commands = self._store.list_commands(group_id=gid)
+        logger.debug(
+            "ButtonBar._populate_buttons: gid=%r -> %d command(s)",
+            gid,
+            len(commands),
+        )
         for cmd in commands:
             btn = QPushButton(cmd.name, self._button_host)
             btn.setToolTip(cmd.command_text)
@@ -204,6 +233,13 @@ class ButtonBar(QFrame):
         available = host.width()
         host_height = host.height() or (MAX_HEIGHT - 4)
         button_height = max(20, min(MAX_HEIGHT - 8, host_height - 2))
+        logger.debug(
+            "ButtonBar._relayout: host=%dx%d btn_h=%d count=%d",
+            available,
+            host_height,
+            button_height,
+            len(self._buttons),
+        )
         if available <= 0:
             return
 

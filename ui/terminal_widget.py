@@ -31,6 +31,7 @@ from PyQt6.QtGui import (
     QTextCursor,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -241,6 +242,13 @@ class TerminalWidget(QWidget):
         self._display.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._display.customContextMenuRequested.connect(self._show_context_menu)
         self._display.installEventFilter(self)
+        # Auto-copy: any selection change pushes the selected text to
+        # the clipboard immediately, so the user never has to press
+        # Ctrl+C or right-click to copy. selectionChanged fires once
+        # when the mouse drag completes (and on every keyboard-driven
+        # selection extension), which is exactly when the spec wants
+        # the clipboard updated.
+        self._display.selectionChanged.connect(self._auto_copy_selection)
         layout.addWidget(self._display, 1)
 
         self._matches: list[_Match] = []
@@ -338,57 +346,89 @@ class TerminalWidget(QWidget):
     # -- right-click menu -------------------------------------------------
 
     def _show_context_menu(self, point) -> None:
-        """Right-click handler.
+        """Right-click handler — always pastes, never shows a menu.
 
-        With a selection active the right-click *pastes* the selected
-        text into the remote session: a single-line selection is sent
-        immediately, a multi-line selection first opens a *Confirm
-        Paste* dialog so the user can review/edit it before sending.
-        With no selection we fall back to the standard Copy / Paste / …
-        menu so those actions are still reachable.
+        Three cases (per UX spec):
+
+        * **Single-line selection**: send the selected text to the
+          remote session immediately.
+        * **Multi-line selection**: open the *Confirm Paste* dialog so
+          the user can review / edit the text before sending.
+        * **No selection**: paste whatever is currently on the system
+          clipboard.
+
+        ``point`` is unused but kept for the
+        :pysignal:`customContextMenuRequested` signature.
         """
+        del point
         cursor = self._display.textCursor()
-        # ``QPlainTextEdit`` uses U+2028 as the line separator inside a
-        # selection; normalise that to ``\n`` so callers don't have to.
+        # ``QPlainTextEdit`` selections use U+2029 (PARAGRAPH SEPARATOR)
+        # between blocks and U+2028 (LINE SEPARATOR) for soft breaks.
+        # Normalise both to ``\n`` so downstream callers and the
+        # multi-line check below see real newlines.
         selected = (
-            cursor.selectedText().replace("\u2028", "\n")
+            cursor.selectedText()
+            .replace("\u2029", "\n")
+            .replace("\u2028", "\n")
             if cursor.hasSelection()
             else ""
         )
 
-        if selected:
-            if "\n" in selected:
-                dlg = ConfirmPasteDialog(selected, self)
+        if not selected:
+            # No selection → paste the system clipboard contents.
+            clipboard = QApplication.clipboard()
+            text = clipboard.text() if clipboard is not None else ""
+            if not text:
+                return
+            if "\n" in text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n"):
+                # Multi-line clipboard contents → confirm before sending.
+                dlg = ConfirmPasteDialog(text, self)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     final = dlg.text()
                     if final:
                         self.text_input.emit(final)
             else:
-                self.text_input.emit(selected)
+                self.text_input.emit(text)
             return
 
-        menu = QMenu(self)
-        menu.addAction(self._make_action("Copy", self._display.copy))
-        menu.addAction(self._make_action("Paste", self._display.paste))
-        menu.addAction(
-            self._make_action(
-                "Copy & Paste",
-                lambda: (self._display.copy(), self._display.paste()),
-            )
-        )
-        menu.addAction(self._make_action("Paste Selection", self._paste_selection))
-        menu.addSeparator()
-        menu.addAction(self._make_action("Send to All Sessions", self._broadcast_selection))
-        menu.addSeparator()
-        menu.addAction(self._make_action("Clear Scrollback Buffer", self._clear_scrollback))
-        menu.addAction(self._make_action("Find …", self.open_find_bar))
-        menu.exec(self._display.mapToGlobal(point))
+        if "\n" in selected:
+            dlg = ConfirmPasteDialog(selected, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                final = dlg.text()
+                if final:
+                    self.text_input.emit(final)
+        else:
+            self.text_input.emit(selected)
 
     def _make_action(self, label: str, slot: Callable[[], None]) -> QAction:
-        """Build a QAction wired to ``slot``."""
+        """Build a QAction wired to ``slot`` (kept for the find-bar menu)."""
         action = QAction(label, self)
         action.triggered.connect(slot)
         return action
+
+    def _auto_copy_selection(self) -> None:
+        """Copy the active selection to the clipboard automatically.
+
+        Wired to :pysignal:`QPlainTextEdit.selectionChanged` so any
+        mouse-drag or keyboard-driven selection ends up on the clipboard
+        without the user having to press *Ctrl+C* or right-click *Copy*.
+        Empty selections are ignored so we don't blow away whatever the
+        user copied previously when they just click around the buffer.
+        """
+        cursor = self._display.textCursor()
+        if not cursor.hasSelection():
+            return
+        text = (
+            cursor.selectedText()
+            .replace("\u2029", "\n")
+            .replace("\u2028", "\n")
+        )
+        if not text:
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is None:  # pragma: no cover — headless edge case
+            return
+        clipboard.setText(text)
 
     def _paste_selection(self) -> None:
         """Paste the current selection (X11 primary selection equivalent)."""
