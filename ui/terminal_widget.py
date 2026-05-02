@@ -48,6 +48,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -180,7 +181,14 @@ _VT_KEYS: dict[int, str] = {
     int(Qt.Key.Key_F10):      "\x1b[21~",
     int(Qt.Key.Key_F11):      "\x1b[23~",
     int(Qt.Key.Key_F12):      "\x1b[24~",
-    int(Qt.Key.Key_Backspace): "\x7f",     # DEL — matches stty erase ^?
+    # Backspace -> BS (^H, 0x08). xterm defaults to DEL (0x7f), but
+    # Cisco IOS / many enterprise gear / some telnet hosts only erase
+    # on receiving 0x08 and treat 0x7f as a literal printable cell
+    # (which manifested as "Backspace moves the cursor right" on the
+    # user's Cisco router). Sending 0x08 is the strictly safer default;
+    # users who need DEL semantics can press Shift+Backspace, which is
+    # mapped to 0x7f via the Ctrl/Shift override below.
+    int(Qt.Key.Key_Backspace): "\x08",
     int(Qt.Key.Key_Tab):      "\t",
     int(Qt.Key.Key_Backtab):  "\x1b[Z",
     int(Qt.Key.Key_Escape):   "\x1b",
@@ -632,7 +640,13 @@ class TerminalWidget(QWidget):
 
     def _refresh_highlights(self) -> None:
         """Re-apply the highlight overlays."""
-        extra: list[QPlainTextEdit.ExtraSelection] = []
+        # PyQt6 exposes ``ExtraSelection`` on :class:`QTextEdit`, not on
+        # :class:`QPlainTextEdit` — even though setExtraSelections lives
+        # on QPlainTextEdit. Constructing it from QPlainTextEdit raises
+        # AttributeError which (under qasync) propagates into a hard
+        # core-dump. Build through QTextEdit; the resulting object is
+        # accepted by both widget classes.
+        extra: list[QTextEdit.ExtraSelection] = []
         match_fmt = QTextCharFormat()
         match_fmt.setBackground(QColor("#f1c40f"))
         current_fmt = QTextCharFormat()
@@ -642,7 +656,7 @@ class TerminalWidget(QWidget):
             cursor = QTextCursor(self._display.document())
             cursor.setPosition(match.start)
             cursor.setPosition(match.end, QTextCursor.MoveMode.KeepAnchor)
-            sel = QPlainTextEdit.ExtraSelection()
+            sel = QTextEdit.ExtraSelection()
             sel.cursor = cursor
             sel.format = current_fmt if i == self._current_match else match_fmt
             extra.append(sel)
@@ -858,6 +872,16 @@ class TerminalWidget(QWidget):
             # shortcut so it's reachable even mid-session.
             if event.key() == Qt.Key.Key_F and ctrl_only:
                 self.open_find_bar()
+                return True
+
+            # Shift+Backspace -> DEL (0x7f) for hosts that distinguish
+            # BS / DEL the modern way (linux ``stty erase ^?``); plain
+            # Backspace stays at BS (0x08), see _VT_KEYS for the
+            # rationale.
+            if event.key() == Qt.Key.Key_Backspace and (
+                mods & Qt.KeyboardModifier.ShiftModifier
+            ):
+                self.text_input.emit("\x7f")
                 return True
 
             # 1. Special keys (arrows, Home/End, Delete, F-keys, …).
