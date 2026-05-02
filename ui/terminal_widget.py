@@ -142,6 +142,53 @@ class _PyteEmulator:
         self.screen.reset()
         self.screen.set_mode(pyte.modes.LNM)
 
+
+# ---------------------------------------------------------------------------
+# Special-key VT escape table
+# ---------------------------------------------------------------------------
+#
+# ``QKeyEvent.text()`` is the empty string for arrow keys, Home / End,
+# Delete, Insert, Page Up / Down, and F1..F12 — Qt only fills ``text``
+# in for keys that produce a printable character. A real terminal
+# expects the application to send the matching VT (xterm-style) escape
+# sequence; without this table those keys would never reach the remote
+# shell, making line editing, history scroll, and TUIs unusable.
+#
+# Sequences below match xterm-256color (the TERM string we'll advertise
+# at PTY-allocation time) so common shells (bash, zsh, fish), readline
+# editors, vim, less, htop, and tmux all interpret them correctly.
+_VT_KEYS: dict[int, str] = {
+    int(Qt.Key.Key_Up):       "\x1b[A",
+    int(Qt.Key.Key_Down):     "\x1b[B",
+    int(Qt.Key.Key_Right):    "\x1b[C",
+    int(Qt.Key.Key_Left):     "\x1b[D",
+    int(Qt.Key.Key_Home):     "\x1b[H",
+    int(Qt.Key.Key_End):      "\x1b[F",
+    int(Qt.Key.Key_Insert):   "\x1b[2~",
+    int(Qt.Key.Key_Delete):   "\x1b[3~",
+    int(Qt.Key.Key_PageUp):   "\x1b[5~",
+    int(Qt.Key.Key_PageDown): "\x1b[6~",
+    int(Qt.Key.Key_F1):       "\x1bOP",
+    int(Qt.Key.Key_F2):       "\x1bOQ",
+    int(Qt.Key.Key_F3):       "\x1bOR",
+    int(Qt.Key.Key_F4):       "\x1bOS",
+    int(Qt.Key.Key_F5):       "\x1b[15~",
+    int(Qt.Key.Key_F6):       "\x1b[17~",
+    int(Qt.Key.Key_F7):       "\x1b[18~",
+    int(Qt.Key.Key_F8):       "\x1b[19~",
+    int(Qt.Key.Key_F9):       "\x1b[20~",
+    int(Qt.Key.Key_F10):      "\x1b[21~",
+    int(Qt.Key.Key_F11):      "\x1b[23~",
+    int(Qt.Key.Key_F12):      "\x1b[24~",
+    int(Qt.Key.Key_Backspace): "\x7f",     # DEL — matches stty erase ^?
+    int(Qt.Key.Key_Tab):      "\t",
+    int(Qt.Key.Key_Backtab):  "\x1b[Z",
+    int(Qt.Key.Key_Escape):   "\x1b",
+    int(Qt.Key.Key_Return):   "\r",
+    int(Qt.Key.Key_Enter):    "\r",
+}
+
+
 # ---------------------------------------------------------------------------
 # Find bar
 # ---------------------------------------------------------------------------
@@ -776,24 +823,60 @@ class TerminalWidget(QWidget):
     # -- key forwarding ----------------------------------------------------
 
     def eventFilter(self, obj, event):  # noqa: N802 — Qt API
-        """Forward typing on the QPlainTextEdit upstream as ``text_input``.
+        """Forward keypresses on the QPlainTextEdit upstream as ``text_input``.
 
-        We *consume* any printable key event after emitting ``text_input`` so
-        the underlying ``QPlainTextEdit`` does not also insert the character
-        locally — otherwise every keystroke would appear twice once the
-        remote echo arrives via :meth:`append_output`. Non-printable keys
-        (arrow keys, modifiers, etc.) fall through to default handling so
-        the user can still navigate the scrollback with the keyboard.
+        Three cases:
+
+        1. *Special keys* (arrow / Home / End / Delete / Insert / Page
+           Up / Down / F1..F12 / Backspace / Tab / Esc / Enter) are
+           translated through :data:`_VT_KEYS` into the matching
+           xterm-style escape sequence and emitted; the QPlainTextEdit's
+           own cursor-movement handlers are bypassed because the next
+           pyte redraw would clobber any local edits anyway.
+        2. *Printable keys* go out via ``event.text()`` (Qt fills this
+           in with the right character for the current keyboard layout
+           and modifiers, including dead keys / IME composition).
+        3. *Ctrl+letter* combos that don't have a text payload (Ctrl+A,
+           Ctrl+C, Ctrl+Z, etc. on layouts where Qt eats the text)
+           are converted to their ASCII control byte (Ctrl+A → 0x01,
+           …, Ctrl+_ → 0x1f) so they reach the remote shell.
+
+        All forwarded events return ``True`` so the underlying
+        QPlainTextEdit does not also process them locally — otherwise
+        each keystroke would appear twice once the remote echo arrived
+        via :meth:`append_output`.
         """
         if obj is self._display and event.type() == event.Type.KeyPress:
             assert isinstance(event, QKeyEvent)
-            if event.key() == Qt.Key.Key_F and (
-                event.modifiers() & Qt.KeyboardModifier.ControlModifier
-            ):
+            mods = event.modifiers()
+            ctrl_only = (
+                mods & Qt.KeyboardModifier.ControlModifier
+                and not (mods & Qt.KeyboardModifier.AltModifier)
+                and not (mods & Qt.KeyboardModifier.MetaModifier)
+            )
+            # Ctrl+F opens the find bar — keep this as the only local
+            # shortcut so it's reachable even mid-session.
+            if event.key() == Qt.Key.Key_F and ctrl_only:
                 self.open_find_bar()
                 return True
+
+            # 1. Special keys (arrows, Home/End, Delete, F-keys, …).
+            seq = _VT_KEYS.get(int(event.key()))
+            if seq is not None:
+                self.text_input.emit(seq)
+                return True
+
+            # 2. Printable keys.
             text = event.text()
             if text:
                 self.text_input.emit(text)
+                return True
+
+            # 3. Ctrl+<letter> combos with empty text payload — convert
+            #    Key_A..Key_Z (0x41..0x5A) to the corresponding ASCII
+            #    control byte 0x01..0x1A.
+            key_val = int(event.key())
+            if ctrl_only and Qt.Key.Key_A <= event.key() <= Qt.Key.Key_Underscore:
+                self.text_input.emit(chr(key_val & 0x1f))
                 return True
         return super().eventFilter(obj, event)
