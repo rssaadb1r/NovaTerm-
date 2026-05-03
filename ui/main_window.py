@@ -36,6 +36,7 @@ from .command_window import DEFAULT_HEIGHT as _CMD_WINDOW_DEFAULT_HEIGHT, Comman
 from .default_session_dialog import DefaultSessionDialog
 from .quick_connect import QuickConnectDialog
 from .session_dialog import SessionDialog
+from .securecrt_import_dialog import SecureCRTImportDialog
 from .session_manager import SessionManagerPanel
 from .settings_dialog import SettingsDialog, load_settings
 from .tab_manager import (
@@ -173,7 +174,16 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self._make_action("Quick Connect…", self._on_quick_connect, "Ctrl+Q"))
         file_menu.addAction(self._make_action("New Session…", self._on_new_session, "Ctrl+N"))
         file_menu.addSeparator()
-        file_menu.addAction(self._make_action("Import Sessions…", self._on_import_sessions))
+        # File → Import → … submenu (NovaTerm JSON + SecureCRT Config tree).
+        import_menu = file_menu.addMenu("&Import")
+        import_menu.addAction(
+            self._make_action("Import Sessions\u2026", self._on_import_sessions)
+        )
+        import_menu.addAction(
+            self._make_action(
+                "Import from SecureCRT\u2026", self._on_import_securecrt
+            )
+        )
         file_menu.addAction(self._make_action("Export Sessions…", self._on_export_sessions))
         file_menu.addSeparator()
         file_menu.addAction(self._make_action("Quit", self.close, "Ctrl+Shift+Q"))
@@ -297,16 +307,70 @@ class MainWindow(QMainWindow):
         return None
 
     def _close_tab(self, index: int) -> None:
-        """Disconnect & remove the tab at ``index``."""
+        """Disconnect & remove the tab at ``index``.
+
+        If the tab has a live SSH client, the user gets a confirmation
+        dialog first — closing the tab disconnects the underlying
+        Paramiko transport, and we don't want a stray Ctrl+W to drop
+        an active production session.
+        """
         if index < 0 or index >= self._tabs.count():
             return
         content = self._content_at(index)
+        client = self._ssh_clients.get(content) if content is not None else None
+        if client is not None and getattr(client, "connected", False):
+            box = QMessageBox(self)
+            box.setWindowTitle("Close Session")
+            box.setText("This will disconnect the SSH session. Are you sure?")
+            box.setIcon(QMessageBox.Icon.Question)
+            disconnect_btn = box.addButton(
+                "Disconnect && Close", QMessageBox.ButtonRole.AcceptRole
+            )
+            cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(cancel_btn)
+            box.exec()
+            if box.clickedButton() is not disconnect_btn:
+                return
         if content is not None:
             self._cluster_targets.discard(content)
             client = self._ssh_clients.pop(content, None)
             if client is not None:
                 asyncio.ensure_future(client.disconnect())
         self._tabs.removeTab(index)
+
+    def closeEvent(self, event):  # noqa: N802 — Qt API
+        """Confirm exit when there are still active SSH sessions.
+
+        Single confirmation covers all open sessions; on accept, every
+        live :class:`AsyncSSHClient` is asked to disconnect cleanly so
+        no orphan Paramiko transports / sockets / SFTP threads outlive
+        the GUI.
+        """
+        live = [
+            (content, client)
+            for content, client in self._ssh_clients.items()
+            if getattr(client, "connected", False)
+        ]
+        if live:
+            box = QMessageBox(self)
+            box.setWindowTitle("Exit NovaTerm")
+            box.setText(
+                f"You have {len(live)} active session(s). Close all and exit?"
+            )
+            box.setIcon(QMessageBox.Icon.Question)
+            exit_btn = box.addButton("Exit", QMessageBox.ButtonRole.AcceptRole)
+            cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(cancel_btn)
+            box.exec()
+            if box.clickedButton() is not exit_btn:
+                event.ignore()
+                return
+            for _content, client in live:
+                try:
+                    asyncio.ensure_future(client.disconnect())
+                except Exception:  # pragma: no cover — best-effort cleanup
+                    pass
+        event.accept()
 
     def _cycle_tab(self, delta: int) -> None:
         """Cycle to the next/prev tab."""
@@ -609,6 +673,15 @@ class MainWindow(QMainWindow):
             payload = fh.read()
         added = self._store.import_sessions_json(payload)
         QMessageBox.information(self, "Import", f"Imported {added} session(s)")
+        self._sidebar.refresh()
+
+    def _on_import_securecrt(self) -> None:
+        """Open the *Import from SecureCRT* dialog (sessions + button bar)."""
+        dlg = SecureCRTImportDialog(self._store, self._commands, self)
+        dlg.exec()
+        # The dialog refreshes the button bar itself; just refresh the
+        # sidebar tree so any newly-imported sessions show up without
+        # the user having to restart.
         self._sidebar.refresh()
 
     def _on_export_sessions(self) -> None:

@@ -94,10 +94,20 @@ class ButtonBar(QFrame):
         # time the bar resizes we walk the button list left to right and
         # hide whatever doesn't fit, exposing the leftover commands via
         # the overflow QToolButton on the right edge.
+        #
+        # The size policy MUST stretch vertically as well as horizontally:
+        # an empty QWidget reports ``sizeHint().height() == 0`` and a
+        # ``Fixed`` vertical policy then collapses the host to 0 px,
+        # causing the buttons (positioned at y=2 / h=28 relative to the
+        # host) to render outside the visible region. A minimum height
+        # equal to ``MAX_HEIGHT - 4`` guarantees at least 32 px of
+        # vertical space for buttons even when the parent layout is
+        # still settling.
         self._button_host = QWidget(self)
         self._button_host.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        self._button_host.setMinimumHeight(MAX_HEIGHT - 4)
         outer.addWidget(self._button_host, 1)
 
         # Shown when the database has no commands at all so the user has
