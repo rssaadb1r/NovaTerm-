@@ -368,6 +368,11 @@ class TerminalWidget(QWidget):
         self._display = QPlainTextEdit(self)
         self._display.setReadOnly(False)
         self._display.setMaximumBlockCount(10_000)  # default scrollback
+        # ``QWidget.setFocus()`` on the outer terminal widget should land
+        # on the QPlainTextEdit so the user can start typing as soon as
+        # the tab is created (e.g. after a Quick-Host-Bar connect) without
+        # having to click into the terminal first.
+        self.setFocusProxy(self._display)
         font = QFont("Monospace", 11)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self._display.setFont(font)
@@ -749,6 +754,28 @@ class TerminalWidget(QWidget):
             new_cursor.setPosition(
                 min(sel_pos, doc_len), QTextCursor.MoveMode.KeepAnchor
             )
+            self._display.setTextCursor(new_cursor)
+        else:
+            # No active selection — anchor the QPlainTextEdit caret to
+            # the current pyte cursor (history row count + cursor.y,
+            # column = cursor.x clamped to the rendered line length).
+            # Without this the native caret stays wherever it last
+            # was — typically block 0 column 0 — while the prompt has
+            # advanced, so the visible blink is misaligned with the
+            # actual end-of-line, which is exactly the user-reported
+            # "the cursor in the session appears at the bottom, not
+            # aligned with the actual text".
+            screen = self._emulator.screen
+            history_rows = len(screen.history.top)
+            target_block_idx = history_rows + int(screen.cursor.y)
+            block = document.findBlockByNumber(target_block_idx)
+            if not block.isValid():
+                block = document.lastBlock()
+            block_start = block.position()
+            block_len = block.length() - 1  # exclude trailing newline
+            col = max(0, min(int(screen.cursor.x), max(0, block_len)))
+            new_cursor = QTextCursor(document)
+            new_cursor.setPosition(block_start + col)
             self._display.setTextCursor(new_cursor)
 
         if at_bottom:

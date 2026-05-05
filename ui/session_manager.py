@@ -6,18 +6,14 @@ Rename / Delete), and drag-and-drop of sessions between folders.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QHBoxLayout,
     QInputDialog,
     QLineEdit,
     QMenu,
     QMessageBox,
-    QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -26,7 +22,7 @@ from PyQt6.QtWidgets import (
 
 from core.session_store import SessionStore
 
-from .colors import PALETTE, color_for
+from .colors import color_for
 
 
 # A custom Qt UserRole offset for the (kind, id) tuple we attach to items.
@@ -151,7 +147,6 @@ class SessionManagerPanel(QWidget):
         """Build the panel widgets and load sessions from ``store``."""
         super().__init__(parent)
         self._store = store
-        self._color_filter: str | None = None
         # Suppress side-effects in ``itemExpanded`` / ``itemCollapsed`` while
         # we programmatically restore the persisted state during ``refresh``.
         self._restoring_state = False
@@ -165,23 +160,6 @@ class SessionManagerPanel(QWidget):
         self._filter.setPlaceholderText("Filter sessions …")
         self._filter.textChanged.connect(self.refresh)
         layout.addWidget(self._filter)
-
-        # Color-dot filter row.
-        dot_row = QHBoxLayout()
-        dot_row.setContentsMargins(0, 0, 0, 0)
-        dot_row.setSpacing(2)
-        for tag in PALETTE:
-            btn = QPushButton(self)
-            btn.setFixedSize(18, 18)
-            btn.setCheckable(True)
-            btn.setStyleSheet(
-                f"QPushButton {{ background:{PALETTE[tag]}; border-radius:9px; }}"
-                "QPushButton:checked { border:2px solid white; }"
-            )
-            btn.clicked.connect(self._make_color_filter(tag))
-            dot_row.addWidget(btn)
-        dot_row.addStretch(1)
-        layout.addLayout(dot_row)
 
         # Tree.
         self._tree = _SessionTreeWidget(self)
@@ -246,11 +224,6 @@ class SessionManagerPanel(QWidget):
                     and query not in (sess.name or "").lower()
                     and query not in (sess.hostname or "").lower()
                     and query not in (sess.group_tag or "").lower()
-                ):
-                    continue
-                if (
-                    self._color_filter
-                    and (sess.color_tag or "").lower() != self._color_filter
                 ):
                     continue
                 item = QTreeWidgetItem([sess.name])
@@ -512,27 +485,13 @@ class SessionManagerPanel(QWidget):
         self.refresh()
 
     def _delete_folder(self, fid: int) -> None:
-        """Confirm and delete a folder; sessions inside drop to the top level."""
+        """Confirm and cascade-delete a folder, its sub-folders and sessions."""
         if QMessageBox.question(
             self,
             "Delete folder",
-            "Delete this folder? Sessions inside will move to the top level.",
+            "Delete this folder and ALL its sub-folders and sessions inside? "
+            "This cannot be undone.",
         ) != QMessageBox.StandardButton.Yes:
             return
         self._store.delete_folder(fid)
         self.refresh()
-
-    # -- color filter -----------------------------------------------------
-
-    def _make_color_filter(self, tag: str) -> Callable[[bool], None]:
-        """Closure factory for the colour-dot filter buttons."""
-
-        def toggle(checked: bool) -> None:
-            self._color_filter = tag if checked else None
-            # Untoggle other dots.
-            for child in self.findChildren(QPushButton):
-                if child.isCheckable() and child.isChecked() and child.styleSheet().find(PALETTE[tag]) == -1:
-                    child.setChecked(False)
-            self.refresh()
-
-        return toggle

@@ -92,11 +92,24 @@ class CommandStore:
                 setattr(row, k, v)
 
     def delete_group(self, group_id: int) -> None:
-        """Delete a command group (commands inside become group-less)."""
+        """Cascade-delete a command group *and every command inside it*.
+
+        SQLite's foreign keys aren't enforced by default under
+        SQLAlchemy, so the FK column's ``ondelete="SET NULL"`` would
+        otherwise leave the commands behind as dangling orphans that
+        the Command Manager rebuild path subsequently re-displays
+        under "(no folder)" — looking exactly like "the folder I
+        deleted came back" from the user's seat.
+        """
         with self._store.session() as s:
             g = s.get(CommandGroup, group_id)
-            if g is not None:
-                s.delete(g)
+            if g is None:
+                return
+            for c in s.scalars(
+                select(Command).where(Command.group_id == group_id)
+            ):
+                s.delete(c)
+            s.delete(g)
 
     # -- commands ----------------------------------------------------------
 

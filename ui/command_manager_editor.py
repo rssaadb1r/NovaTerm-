@@ -366,19 +366,20 @@ class CommandManagerEditor(QDialog):
         group = self._selected_group()
         if group is None:
             return
+        n = len(group.commands)
+        msg = (
+            f"Delete folder '{group.name}' and ALL {n} command(s) inside it?"
+            if n
+            else f"Delete folder '{group.name}'?"
+        )
         if (
-            QMessageBox.question(
-                self,
-                "Delete folder",
-                f"Delete folder '{group.name}' and move its commands "
-                f"to (no folder)?",
-            )
+            QMessageBox.question(self, "Delete folder", msg)
             != QMessageBox.StandardButton.Yes
         ):
             return
-        # Reparent rather than orphaning visually; on save we'll set
-        # group_id=None on the moved commands.
-        self._orphans.extend(group.commands)
+        # Cascade: drop the group AND every command in it from the
+        # working set. The save path will then translate the missing
+        # ids into ``delete_command`` / ``delete_group`` calls.
         self._groups.remove(group)
         self._rebuild_tree()
 

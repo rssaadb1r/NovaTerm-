@@ -98,17 +98,58 @@ def test_folder_expand_state_persists(store: SessionStore) -> None:
     assert next(f for f in store.list_folders() if f.id == fid).is_expanded is False
 
 
-def test_folder_rename_and_delete_reparents_sessions(store: SessionStore) -> None:
+def test_folder_rename_and_cascade_delete(store: SessionStore) -> None:
+    """``delete_folder`` cascades through sub-folders and sessions.
+
+    Tree::
+
+        Old name              (fid)
+        ├── srv                       (session inside fid)
+        └── child                     (sub-folder of fid)
+            ├── srv2                  (session inside child)
+            └── grand                 (sub-sub-folder of child)
+                └── srv3              (session inside grand)
+
+    Deleting ``fid`` removes every node above plus the
+    sibling-untouched control row.
+    """
     fid = store.create_folder("Old name")
+    child_fid = store.create_folder("child", parent_id=fid)
+    grand_fid = store.create_folder("grand", parent_id=child_fid)
     sid = store.create_session(
         name="srv", hostname="h", port=22, protocol="ssh", folder_id=fid
     )
+    sid2 = store.create_session(
+        name="srv2", hostname="h2", port=22, protocol="ssh", folder_id=child_fid
+    )
+    sid3 = store.create_session(
+        name="srv3", hostname="h3", port=22, protocol="ssh", folder_id=grand_fid
+    )
+    # Rename round-trips before we destroy the tree.
     store.update_folder(fid, name="New name")
     assert next(f for f in store.list_folders() if f.id == fid).name == "New name"
 
+    # Sibling control: unrelated folder + session must survive.
+    other_fid = store.create_folder("Other")
+    other_sid = store.create_session(
+        name="other-srv",
+        hostname="z",
+        port=22,
+        protocol="ssh",
+        folder_id=other_fid,
+    )
+
     store.delete_folder(fid)
-    # Session falls back to top-level (folder_id NULL) rather than being deleted.
-    sess = store.get_session(sid)
-    assert sess is not None
-    assert sess.folder_id is None
-    assert all(f.id != fid for f in store.list_folders())
+
+    # Every doomed folder and session is gone.
+    folder_ids = {f.id for f in store.list_folders()}
+    assert fid not in folder_ids
+    assert child_fid not in folder_ids
+    assert grand_fid not in folder_ids
+    assert store.get_session(sid) is None
+    assert store.get_session(sid2) is None
+    assert store.get_session(sid3) is None
+
+    # Sibling subtree untouched.
+    assert other_fid in folder_ids
+    assert store.get_session(other_sid) is not None

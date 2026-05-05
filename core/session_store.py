@@ -362,20 +362,39 @@ class SessionStore:
                 setattr(row, k, v)
 
     def delete_folder(self, folder_id: int) -> None:
-        """Delete a folder; sessions in it have their ``folder_id`` cleared."""
+        """Cascade-delete a folder and *everything* it contains.
+
+        The user-facing contract is "deleting a folder removes the
+        folder, all of its sub-folders, and every session inside any
+        of them". SQLite's foreign keys are not enforced by default
+        under SQLAlchemy, so we walk the tree in Python and delete the
+        rows explicitly.
+        """
         with self.session() as s:
-            row = s.get(Folder, folder_id)
-            if row is None:
+            root = s.get(Folder, folder_id)
+            if root is None:
                 return
+            # Breadth-first walk of every descendant folder id (root included).
+            doomed_folder_ids: list[int] = []
+            queue: list[int] = [folder_id]
+            while queue:
+                fid = queue.pop()
+                doomed_folder_ids.append(fid)
+                for child in s.scalars(
+                    select(Folder).where(Folder.parent_id == fid)
+                ):
+                    queue.append(int(child.id))
+            # Drop every session inside any doomed folder.
             for sess_row in s.scalars(
-                select(Session).where(Session.folder_id == folder_id)
+                select(Session).where(Session.folder_id.in_(doomed_folder_ids))
             ):
-                sess_row.folder_id = None
-            for child in s.scalars(
-                select(Folder).where(Folder.parent_id == folder_id)
-            ):
-                child.parent_id = row.parent_id
-            s.delete(row)
+                s.delete(sess_row)
+            # Drop the folders deepest-first so SQLAlchemy doesn't flush a
+            # parent row whose children still reference it.
+            for fid in reversed(doomed_folder_ids):
+                doomed = s.get(Folder, fid)
+                if doomed is not None:
+                    s.delete(doomed)
 
     def set_folder_expanded(self, folder_id: int, expanded: bool) -> None:
         """Persist the expand/collapse state for a folder."""

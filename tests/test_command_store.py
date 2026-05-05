@@ -62,6 +62,29 @@ def test_reorder_command_swaps_neighbours(store: SessionStore) -> None:
     assert [c.name for c in cs.list_commands(group_id=gid)] == ["b", "c", "a"]
 
 
+def test_delete_group_cascades_commands(store: SessionStore) -> None:
+    """Deleting a command group must remove every command inside it.
+
+    Without the cascade the FK column ``group_id`` was simply set to
+    NULL (SQLAlchemy's ``ondelete="SET NULL"``) and the orphan rows
+    stuck around in the database, so reopening the Command Manager
+    showed them under "(no folder)" — the user-visible bug "the
+    folder I deleted came back".
+    """
+    cs = CommandStore(store)
+    gid = cs.create_group("Diagnostics")
+    cs.create_command(name="uptime", command_text="uptime", group_id=gid)
+    cs.create_command(name="disks", command_text="df -h", group_id=gid)
+    other_gid = cs.create_group("Net")
+    cs.create_command(name="ping", command_text="ping", group_id=other_gid)
+
+    cs.delete_group(gid)
+
+    assert [g.name for g in cs.list_groups()] == ["Net"]
+    # Diagnostics' commands are gone (not orphaned).
+    assert [c.name for c in cs.list_commands()] == ["ping"]
+
+
 def test_command_import_export_roundtrip(store: SessionStore) -> None:
     cs = CommandStore(store)
     gid = cs.create_group("Net")

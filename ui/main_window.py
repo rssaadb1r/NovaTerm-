@@ -292,6 +292,12 @@ class MainWindow(QMainWindow):
         )
         idx = self._tabs.add_tab(content)
         self._tabs.setCurrentIndex(idx)
+        # Hand the keyboard focus to the new terminal so the user can
+        # start typing immediately after a saved-session, Quick Connect
+        # or Quick-Host-Bar invocation — otherwise focus stays on
+        # whatever widget triggered the connect (the Host bar, the
+        # sidebar, etc.) and the first keystroke is dropped on the floor.
+        terminal.setFocus(Qt.FocusReason.OtherFocusReason)
         return content
 
     def _content_at(self, index: int) -> TabContent | None:
