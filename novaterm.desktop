@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NovaTerm
+GenericName=SSH / Telnet Terminal
+Comment=SecureCRT-inspired multi-protocol terminal client
+Exec=novaterm
+Icon=utilities-terminal
+Terminal=false
+Categories=Network;TerminalEmulator;System;
+Keywords=ssh;telnet;terminal;sftp;
+StartupNotify=true

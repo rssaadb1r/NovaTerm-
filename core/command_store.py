@@ -1,0 +1,241 @@
+"""CRUD helpers for the Command Manager (Feature 5).
+
+Backed by the same SQLite database as :mod:`core.session_store`.
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import select
+
+from .session_store import Command, CommandGroup, SessionStore
+
+# Variable substitution pattern (see CLAUDE.md §8).
+_VAR_RE = re.compile(r"%(HOST|USER|SESSION|DATE|TIME)%")
+
+
+def _safe_filename(text: str) -> str:
+    """Sanitise text for safe inclusion in a filename.
+
+    Drops every character that is not an ASCII letter, digit, ``_`` or
+    ``-``. In particular ``.`` is *not* preserved — leaving it in would
+    let a session named ``..`` collapse to ``..`` and walk out of the
+    intended log directory when ``%SESSION%`` is substituted into a
+    path template (path-traversal via the variable substitution layer).
+    """
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", text or "session")
+
+
+def substitute_variables(
+    text: str,
+    *,
+    hostname: str | None = None,
+    username: str | None = None,
+    session_name: str | None = None,
+    when: datetime | None = None,
+) -> str:
+    """Expand ``%HOST% / %USER% / %SESSION% / %DATE% / %TIME%`` tokens.
+
+    Unknown tokens are left untouched.
+
+    :param text: Source text containing zero or more tokens.
+    :param hostname: Replacement for ``%HOST%``.
+    :param username: Replacement for ``%USER%``.
+    :param session_name: Replacement for ``%SESSION%`` (sanitised).
+    :param when: Datetime used for ``%DATE%`` and ``%TIME%``; defaults to now.
+    """
+    when = when or datetime.now()
+    mapping = {
+        "HOST": hostname or "",
+        "USER": username or "",
+        "SESSION": _safe_filename(session_name or ""),
+        "DATE": when.strftime("%Y-%m-%d"),
+        "TIME": when.strftime("%H-%M-%S"),
+    }
+    return _VAR_RE.sub(lambda m: mapping[m.group(1)], text)
+
+
+class CommandStore:
+    """High-level CRUD wrapper around :class:`Command` + :class:`CommandGroup`."""
+
+    def __init__(self, store: SessionStore) -> None:
+        """Bind to an existing :class:`SessionStore`."""
+        self._store = store
+
+    # -- groups ------------------------------------------------------------
+
+    def create_group(self, name: str, sort_order: int = 0) -> int:
+        """Create a command group and return its id."""
+        with self._store.session() as s:
+            g = CommandGroup(name=name, sort_order=sort_order)
+            s.add(g)
+            s.flush()
+            return g.id
+
+    def list_groups(self) -> list[CommandGroup]:
+        """Return all command groups ordered by ``sort_order`` then name."""
+        with self._store.session() as s:
+            return list(
+                s.scalars(select(CommandGroup).order_by(CommandGroup.sort_order, CommandGroup.name))
+            )
+
+    def update_group(self, group_id: int, **fields: Any) -> None:
+        """Update fields on an existing :class:`CommandGroup` row."""
+        with self._store.session() as s:
+            row = s.get(CommandGroup, group_id)
+            if row is None:
+                raise KeyError(f"CommandGroup id={group_id} not found")
+            for k, v in fields.items():
+                setattr(row, k, v)
+
+    def delete_group(self, group_id: int) -> None:
+        """Cascade-delete a command group *and every command inside it*.
+
+        SQLite's foreign keys aren't enforced by default under
+        SQLAlchemy, so the FK column's ``ondelete="SET NULL"`` would
+        otherwise leave the commands behind as dangling orphans that
+        the Command Manager rebuild path subsequently re-displays
+        under "(no folder)" — looking exactly like "the folder I
+        deleted came back" from the user's seat.
+        """
+        with self._store.session() as s:
+            g = s.get(CommandGroup, group_id)
+            if g is None:
+                return
+            for c in s.scalars(
+                select(Command).where(Command.group_id == group_id)
+            ):
+                s.delete(c)
+            s.delete(g)
+
+    # -- commands ----------------------------------------------------------
+
+    def create_command(self, **fields: Any) -> int:
+        """Create a command row and return its id."""
+        with self._store.session() as s:
+            c = Command(**fields)
+            s.add(c)
+            s.flush()
+            return c.id
+
+    def update_command(self, command_id: int, **fields: Any) -> None:
+        """Update fields on an existing command row."""
+        with self._store.session() as s:
+            row = s.get(Command, command_id)
+            if row is None:
+                raise KeyError(f"Command id={command_id} not found")
+            for k, v in fields.items():
+                setattr(row, k, v)
+
+    def delete_command(self, command_id: int) -> None:
+        """Delete a command row by id."""
+        with self._store.session() as s:
+            row = s.get(Command, command_id)
+            if row is not None:
+                s.delete(row)
+
+    def list_commands(self, group_id: int | None = None) -> list[Command]:
+        """Return all commands ordered by ``(sort_order, name)``.
+
+        :param group_id: If given, restrict the result to commands inside
+            that :class:`CommandGroup`.
+        """
+        with self._store.session() as s:
+            stmt = select(Command).order_by(Command.sort_order, Command.name)
+            if group_id is not None:
+                stmt = stmt.where(Command.group_id == group_id)
+            return list(s.scalars(stmt))
+
+    def reorder_command(self, command_id: int, *, delta: int) -> None:
+        """Swap a command with its neighbour (``delta`` is ``-1`` or ``+1``).
+
+        Reordering happens within the command's own group; commands in
+        other groups are left alone. If the command is already at the top
+        (or bottom) of its group nothing happens.
+        """
+        if delta not in (-1, 1):
+            raise ValueError("delta must be -1 or +1")
+        with self._store.session() as s:
+            cmd = s.get(Command, command_id)
+            if cmd is None:
+                return
+            siblings = list(
+                s.scalars(
+                    select(Command)
+                    .where(Command.group_id == cmd.group_id)
+                    .order_by(Command.sort_order, Command.name, Command.id)
+                )
+            )
+            try:
+                pos = siblings.index(cmd)
+            except ValueError:
+                return
+            new_pos = pos + delta
+            if new_pos < 0 or new_pos >= len(siblings):
+                return
+            # Re-pack ``sort_order`` so the result is stable even if the
+            # rows previously shared the same value (e.g. all zero from
+            # the legacy schema).
+            reordered = list(siblings)
+            reordered[pos], reordered[new_pos] = reordered[new_pos], reordered[pos]
+            for idx, row in enumerate(reordered):
+                row.sort_order = idx
+
+    def search_commands(self, query: str) -> list[Command]:
+        """Naive fuzzy search: match contiguous letters of ``query`` in name/text."""
+        from sqlalchemy import func as f
+
+        q = f"%{query.lower()}%"
+        with self._store.session() as s:
+            stmt = select(Command).where(
+                f.lower(Command.name).like(q) | f.lower(Command.command_text).like(q)
+            )
+            return list(s.scalars(stmt))
+
+    # -- import / export ---------------------------------------------------
+
+    def export_json(self) -> str:
+        """Serialise every command + group to a JSON string."""
+        groups = [{"id": g.id, "name": g.name, "sort_order": g.sort_order} for g in self.list_groups()]
+        commands = [
+            {
+                "name": c.name,
+                "command_text": c.command_text,
+                "description": c.description,
+                "tags": list(c.tags or []),
+                "hotkey": c.hotkey,
+                "group_id": c.group_id,
+            }
+            for c in self.list_commands()
+        ]
+        return json.dumps({"groups": groups, "commands": commands}, indent=2)
+
+    def import_json(self, payload: str) -> int:
+        """Import commands + groups from a JSON document. Returns command count."""
+        data = json.loads(payload)
+        added = 0
+        id_map: dict[int, int] = {}
+        with self._store.session() as s:
+            for g in data.get("groups", []) or []:
+                row = CommandGroup(name=g["name"], sort_order=int(g.get("sort_order", 0)))
+                s.add(row)
+                s.flush()
+                id_map[int(g["id"])] = row.id
+            for c in data.get("commands", []) or []:
+                gid = c.get("group_id")
+                mapped_gid = id_map.get(int(gid)) if gid is not None else None
+                s.add(
+                    Command(
+                        group_id=mapped_gid,
+                        name=c["name"],
+                        command_text=c["command_text"],
+                        description=c.get("description"),
+                        tags=list(c.get("tags") or []),
+                        hotkey=c.get("hotkey"),
+                    )
+                )
+                added += 1
+        return added
